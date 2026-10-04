@@ -44,9 +44,11 @@ WANT_RFP=0     # --rfp: open an RFP issue without asking
 REPO_ARG=""
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/storepublisher"
 CONF="$CONF_DIR/last.conf"     # answers that carry across tasks (fork, clone, user)
-TASK_DIR="$CONF_DIR/tasks"     # one file per task: this store, this app, this version
+TASK_DIR="$CONF_DIR/tasks"     # one task per app: its answers, and how its submissions went
 STORE_ID=fdroid
 PR_ONLY=0      # -p: pick a finished task and open its merge request
+STATUS_ONLY=0  # --status: how each app's submission is doing, then exit
+STATUS_APP=""
 
 usage() {
   cat <<'USAGE'
@@ -64,13 +66,18 @@ fdroid-submit.sh — interactive wizard for getting an Android app into F-Droid.
       --no-save     do not remember the answers for next time
   -p, --pull-request  pick a task that pushed its branch and open its merge
                     request — nothing else
+      --status [ID] how each app's submission is doing: F-Droid, the merge
+                    request, its pipeline, the reviewers' comments — then exit
       --forget      delete every remembered answer and task, and exit
-      --forget-app  forget every task for one application id
+      --forget-app  forget the task of one application id
       --forget-task forget one task by name (as the task list shows it)
 
 Detects what it can from your app's git checkout and only asks for the rest,
 writes metadata/<applicationId>.yml into your fdroiddata fork, validates it,
-pushes a branch and — with glab logged in — opens the merge request.
+pushes a branch and — with glab logged in — opens the merge request as a
+draft, watches its pipeline, and marks it ready for review once it passes.
+Each app is one task, which follows it from the first merge request to
+F-Droid and through every update after.
 USAGE
 }
 
@@ -86,14 +93,17 @@ while [ $# -gt 0 ]; do
     --no-save)    SAVE=0 ;;
     --forget)     rm -rf "$CONF" "$TASK_DIR"; printf 'forgot %s and every task\n' "$CONF"; exit 0 ;;
     -p|--pull-request) PR_ONLY=1 ;;
+    --status)     STATUS_ONLY=1
+                  case "${2-}" in ''|-*) ;; *) STATUS_APP="$2"; shift ;; esac ;;
     --forget-task) FORGET_TASK="${2-}"; shift
                   [ -n "$FORGET_TASK" ] || { printf 'which task? --forget-task <name>\n' >&2; exit 2; }
-                  rm -f "$TASK_DIR/$FORGET_TASK.conf" "$TASK_DIR/$FORGET_TASK.mr.md"
+                  rm -f "$TASK_DIR/$FORGET_TASK.conf" "$TASK_DIR/$FORGET_TASK.mr.md" "$TASK_DIR/$FORGET_TASK.log"
                   printf 'forgot task %s\n' "$FORGET_TASK"; exit 0 ;;
     --forget-app) FORGET_APP="${2-}"; shift
                   [ -n "$FORGET_APP" ] || { printf 'which app? --forget-app <applicationId>\n' >&2; exit 2; }
-                  rm -f "$TASK_DIR/$STORE_ID-$FORGET_APP"-*.conf "$TASK_DIR/$STORE_ID-$FORGET_APP"-*.mr.md
-                  printf 'forgot every task for %s\n' "$FORGET_APP"; exit 0 ;;
+                  rm -f "$TASK_DIR/$STORE_ID-$FORGET_APP".conf "$TASK_DIR/$STORE_ID-$FORGET_APP".mr.md \
+                        "$TASK_DIR/$STORE_ID-$FORGET_APP".log
+                  printf 'forgot the task for %s\n' "$FORGET_APP"; exit 0 ;;
     *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
@@ -299,14 +309,21 @@ save_answers() {
 }
 
 # ------------------------------------------------- what this app answered last
-# $CONF_DIR/apps/<appid>.conf holds every answer this app has been given, plus
-# the milestones that leave your machine (tag pushed, branch pushed, merge
-# request, release). A re-run walks all five sections again — that is the point,
-# they check each other — but every question comes back with last time's answer
-# as its default, and every finished step is recognised instead of redone.
+# One task per app. $TASK_DIR/fdroid-<appid>.conf holds every answer the app
+# has been given and where its submission stands — the version being sent, the
+# tag, the branch, the merge request, its pipeline, the last comment you saw —
+# and fdroid-<appid>.log is its timeline: the merge request opened as a draft,
+# the pipeline, marked ready, the reviewers' comments, merged, published, then
+# the next update. A re-run walks all five sections again — that is the point,
+# they check each other — but every question comes back with last time's
+# answer as its default, and every finished step is recognised, not redone.
 declare -A MEM=()
 TASK_FILE=""
-task_id() { printf '%s-%s-%s' "$STORE_ID" "${APPID:-unknown}" "${VCODE:-0}"; }
+task_id() { printf '%s-%s' "$STORE_ID" "${APPID:-unknown}"; }
+tlog() {  # tlog <event> — one line in this app's timeline
+  { [ "$SAVE" = 1 ] && [ -n "$TASK_FILE" ]; } || return 0
+  printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M')" "$*" >> "${TASK_FILE%.conf}.log"
+}
 
 read_task() {  # read_task <file> — merge its answers in, without overwriting this run's
   local k
@@ -318,7 +335,7 @@ read_task() {  # read_task <file> — merge its answers in, without overwriting 
     [ -v "MEM[$k]" ] || MEM["$k"]="${REM[$k]}"
   done
 }
-state_load() {  # settle which task file this run belongs to, and load it
+state_load() {  # this app's task: load it
   TASK_FILE="$TASK_DIR/$(task_id).conf"
   read_task "$TASK_FILE"
   remember ST_STORE "$STORE_ID"
@@ -330,7 +347,7 @@ state_save() {
   local k
   mkdir -p "${TASK_FILE%/*}"
   {
-    printf '# fdroid-submit.sh — task %s\n' "$(basename "${TASK_FILE%.conf}")"
+    printf '# fdroid-submit.sh — task %s (one per app)\n' "$(basename "${TASK_FILE%.conf}")"
     printf '# delete this file, or run --forget-task, to start it afresh\n'
     for k in "${!MEM[@]}"; do printf 'REM[%s]=%q\n' "$k" "${MEM[$k]}"; done
   } > "$TASK_FILE.tmp" && mv "$TASK_FILE.tmp" "$TASK_FILE"
@@ -374,8 +391,60 @@ migrate_tasks() {
   : > "$CONF_DIR/.migrated"
 }
 
-# task_rows — one line per task of this store, newest first:
-#   <file>TAB<appid>TAB<version>TAB<status>TAB<when>
+# Tasks used to be one per version: fdroid-<appid>-<versionCode>.conf. They
+# are folded into one per app — the newest answers win, and what each version
+# got to starts the app's timeline. The old files are kept in per-version/.
+migrate_per_app() {
+  local f b vc id ids=""
+  for f in "$TASK_DIR/$STORE_ID"-*-[0-9]*.conf; do
+    [ -f "$f" ] || continue
+    b="$(basename "$f" .conf)"; vc="${b##*-}"
+    case "$vc" in *[!0-9]*) continue ;; esac
+    id="${b#"$STORE_ID"-}"; id="${id%-*}"
+    case " $ids " in *" $id "*) ;; *) ids="$ids $id" ;; esac
+  done
+  [ -n "$ids" ] || return 0
+  mkdir -p "$TASK_DIR/per-version"
+  for id in $ids; do
+    (
+      out="$TASK_DIR/$STORE_ID-$id.conf"; log="$TASK_DIR/$STORE_ID-$id.log"
+      declare -A ALL=() REM=()
+      if [ -f "$out" ]; then
+        # shellcheck disable=SC1090
+        . "$out" 2>/dev/null || true
+        for k in "${!REM[@]}"; do ALL["$k"]="${REM[$k]}"; done
+      fi
+      while IFS=$'\t' read -r vc f; do
+        REM=()
+        # shellcheck disable=SC1090
+        . "$f" 2>/dev/null || continue
+        for k in "${!REM[@]}"; do [ -n "${REM[$k]}" ] && ALL["$k"]="${REM[$k]}"; done
+        printf '%s  %s (%s): %s%s\n' "${REM[ST_RUN]:-?}" "${REM[VNAME]:-?}" "${REM[VCODE]:-$vc}" \
+          "${REM[ST_STATUS]:-started}" "${REM[ST_MR]:+ — ${REM[ST_MR]}}" >> "$log"
+        if [ -f "${f%.conf}.mr.md" ]; then
+          cp "${f%.conf}.mr.md" "${out%.conf}.mr.md"
+          mv -f "${f%.conf}.mr.md" "$TASK_DIR/per-version/"
+        fi
+        mv -f "$f" "$TASK_DIR/per-version/"
+      done < <(for f in "$TASK_DIR/$STORE_ID-$id"-[0-9]*.conf; do
+                 b="$(basename "$f" .conf)"; printf '%s\t%s\n' "${b##*-}" "$f"
+               done | sort -n)
+      ALL[ST_VNAME]="${ALL[VNAME]:-}"; ALL[ST_VCODE]="${ALL[VCODE]:-}"
+      # an open merge request outlives the version it was opened for
+      [ -n "${ALL[ST_MR]:-}" ] && case "${ALL[ST_STATUS]:-}" in started|pushed|'') ALL[ST_STATUS]=submitted ;; esac
+      {
+        printf '# fdroid-submit.sh — task %s (one per app)\n' "$STORE_ID-$id"
+        printf '# delete this file, or run --forget-app %s, to start it afresh\n' "$id"
+        for k in "${!ALL[@]}"; do printf 'REM[%s]=%q\n' "$k" "${ALL[$k]}"; done
+      } > "$out"
+      chmod 600 "$out" 2>/dev/null || true
+    )
+    note "$id: its tasks, one per version until now, are one task for the app"
+  done
+}
+
+# task_rows — one line per app, newest first:
+#   <file>TAB<appid>TAB<version>TAB<status in words>TAB<when>TAB<status>TAB<branch>
 task_rows() {
   local f
   for f in $(ls -t "$TASK_DIR/$STORE_ID"-*.conf 2>/dev/null || true); do
@@ -384,43 +453,42 @@ task_rows() {
       declare -A REM=()
       # shellcheck disable=SC1090
       . "$f" 2>/dev/null || exit 0
-      printf '%s\t%s\t%s\t%s\t%s\n' "$f" \
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$f" \
         "${REM[ST_APPID]:-${REM[APPID]:-?}}" \
-        "${REM[VNAME]:-?}+${REM[VCODE]:-?}" \
-        "${REM[ST_STATUS]:-started}" \
-        "${REM[ST_RUN]:-}"
+        "${REM[ST_VNAME]:-${REM[VNAME]:-?}}+${REM[ST_VCODE]:-${REM[VCODE]:-?}}" \
+        "$(status_words "${REM[ST_STATUS]:-started}" "${REM[ST_PIPE]:-}" "${REM[ST_REPLY]:-0}")" \
+        "${REM[ST_RUN]:-}" "${REM[ST_STATUS]:-started}" "${REM[ST_BRANCH]:-}"
     )
   done
 }
 
-# pick_task [status-filter] — show this store's tasks and load the chosen one.
-# Selecting one makes its answers the defaults for this run; with a filter, only
-# tasks in that state are offered. Returns 1 when nothing was picked.
+# pick_task [with-branch] — show the apps' tasks and load the chosen one.
+# Selecting one makes its answers the defaults for this run; with a filter,
+# only apps with a branch on the fork are offered. Returns 1 when nothing was
+# picked — "n" is a new app, whose repo is then asked for.
 pick_task() {
   local want="${1-}" rows=() row n=0 f appid ver st when choice
   while IFS= read -r row; do
     [ -n "$row" ] || continue
-    st="$(printf '%s' "$row" | cut -f4)"
     case "$want" in
       '') ;;
-      pushed-or-submitted) case "$st" in pushed|submitted) ;; *) continue ;; esac ;;
-      *) [ "$st" = "$want" ] || continue ;;
+      *) [ -n "$(printf '%s' "$row" | cut -f7)" ] || continue ;;
     esac
     rows+=("$row")
   done <<EOF
 $(task_rows)
 EOF
   [ "${#rows[@]}" -gt 0 ] || return 1
-  step "Tasks"
+  step "Your apps"
   for row in "${rows[@]}"; do
     n=$((n + 1))
     appid="$(printf '%s' "$row" | cut -f2)"
     ver="$(printf '%s' "$row" | cut -f3)"
     st="$(printf '%s' "$row" | cut -f4)"
     when="$(printf '%s' "$row" | cut -f5)"
-    printf '     %2d) %-34s %-12s %-10s %s\n' "$n" "$appid" "$ver" "$st" "$when"
+    printf '     %2d) %-30s %-11s %s  %s%s%s\n' "$n" "$appid" "$ver" "$st" "$DIM" "$when" "$R"
   done
-  [ -z "$want" ] && printf '     %2s) %s\n' "n" "start a new task"
+  [ -z "$want" ] && printf '     %2s) %s\n' "n" "another app — a new task, its repo asked for"
   if [ "$ASSUME_YES" = 1 ]; then choice=1; else
     printf '   %sContinue%s [1]: ' "$B" "$R" >&2
     readline choice
@@ -434,7 +502,6 @@ EOF
   f="$(printf '%s' "${rows[$((choice - 1))]}" | cut -f1)"
   read_task "$f"
   TASK_FILE="$f"
-  ok "continuing $(basename "${f%.conf}")"
   return 0
 }
 
@@ -608,10 +675,12 @@ FDROIDDATA_UPSTREAM="${FDROIDDATA_UPSTREAM:-https://gitlab.com/fdroid/fdroiddata
 glab_ready() { have glab && glab auth status --hostname gitlab.com >/dev/null 2>&1; }
 
 glab_fd() {
+  # glab reads the current folder's git remotes even with -R; an app repo on
+  # GitHub makes it give up, so run it in fdroiddata, or a folder with none
   if [ -d "${FDROIDDATA:-}/.git" ]; then
     ( cd "$FDROIDDATA" && glab "$@" )
   else
-    glab "$@"
+    ( cd "$WORK" && glab "$@" )
   fi
 }
 
@@ -643,6 +712,454 @@ urlencode() {  # percent-encode every byte except RFC 3986 unreserved ones
     esac
   done
   printf '%s' "$out"
+}
+
+# ------------------------------------------------- following a submission
+# Where an app's submission stands, live: f-droid.org says which versions are
+# out, fdroiddata's master which are merged, GitLab how the merge request is
+# doing — draft or ready, its labels, its pipeline and that pipeline's jobs,
+# and what the reviewers wrote. Reading comments needs a login (glab, or
+# $GITLAB_TOKEN); everything else is public.
+cat > "$WORK/gl.py" <<'PYGL'
+import datetime, json, shlex, sys
+
+
+def load(path):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return None
+
+
+def ago(iso):
+    if not iso:
+        return ''
+    try:
+        t = datetime.datetime.fromisoformat(iso.replace('Z', '+00:00'))
+    except ValueError:
+        return iso
+    s = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    for n, unit in ((86400, 'day'), (3600, 'hour'), (60, 'minute')):
+        if s >= n:
+            k = int(s // n)
+            return '%d %s%s ago' % (k, unit, '' if k == 1 else 's')
+    return 'just now'
+
+
+def cmd_mr(path):
+    """shell assignments M_* for one merge request"""
+    m = load(path)
+    if not isinstance(m, dict) or 'iid' not in m:
+        print('M_OK=0')
+        return
+    hp = m.get('head_pipeline') or {}
+    v = {
+        'M_OK': 1, 'M_IID': m.get('iid'), 'M_STATE': m.get('state'),
+        'M_DRAFT': 1 if (m.get('draft') or m.get('work_in_progress')) else 0,
+        'M_TITLE': m.get('title'), 'M_URL': m.get('web_url'),
+        'M_LABELS': ','.join(m.get('labels') or []),
+        'M_BRANCH': m.get('source_branch'), 'M_SRC_PID': m.get('source_project_id'),
+        'M_SHA': m.get('sha'), 'M_MERGED': ago(m.get('merged_at')),
+        'M_PIPE_ID': hp.get('id'), 'M_PIPE_STATUS': hp.get('status'),
+        'M_PIPE_URL': hp.get('web_url'), 'M_PIPE_PID': hp.get('project_id'),
+        'M_PIPE_SHA': hp.get('sha'), 'M_PIPE_WHEN': ago(hp.get('updated_at') or hp.get('created_at')),
+    }
+    for k, x in v.items():
+        print('%s=%s' % (k, shlex.quote('' if x is None else str(x))))
+
+
+def cmd_mrs(path, appid, me):
+    """'<iid> <url>' of the open merge request from this app's branch"""
+    d = load(path)
+    for m in d if isinstance(d, list) else []:
+        branch = m.get('source_branch') or ''
+        who = (m.get('author') or {}).get('username')
+        if (branch == appid or branch.startswith(appid + '-')) and (not me or who == me):
+            print(m.get('iid'), m.get('web_url'))
+            return
+
+
+def cmd_jobs(path):
+    """a tally, then '<status> TAB <name> TAB <url> TAB <id>' per job"""
+    d = load(path)
+    if not isinstance(d, list):
+        return
+    tally = {}
+    for j in d:
+        tally[j.get('status')] = tally.get(j.get('status'), 0) + 1
+    print('TALLY\t' + ', '.join('%d %s' % (n, s) for s, n in sorted(tally.items())))
+    for j in d:
+        print('\t'.join(str(j.get(k) or '') for k in ('status', 'name', 'web_url', 'id')))
+
+
+def cmd_notes(path, since, me):
+    """what people other than you wrote after note <since>; on a first look only
+    the newest two. TOP: the newest note id. REPLY 1: the last word is theirs
+    (your own comments and pushes count as yours)."""
+    d = load(path)
+    if not isinstance(d, list):
+        print('ERR')
+        return
+    since = int(since or 0)
+    top, mine, theirs, new = since, '', '', []
+    for n in d:
+        nid = int(n.get('id') or 0)
+        who = (n.get('author') or {}).get('username') or '?'
+        when = n.get('created_at') or ''
+        top = max(top, nid)
+        if who == me:
+            mine = max(mine, when)
+        elif not n.get('system'):
+            theirs = max(theirs, when)
+            if nid > since:
+                body = ' '.join((n.get('body') or '').split())
+                new.append('NOTE\t%d\t%s\t%s\t%s' % (nid, who, ago(when), body[:160]))
+    print('TOP\t%d' % top)
+    print('REPLY\t%d' % (1 if theirs and theirs > mine else 0))
+    if not since and len(new) > 2:
+        print('OLDER\t%d' % (len(new) - 2))
+        new = new[-2:]
+    print('\n'.join(new))
+
+
+def cmd_pkg(path):
+    """the versions f-droid.org publishes, newest first: name TAB code"""
+    d = load(path)
+    if isinstance(d, dict):
+        for x in d.get('packages') or []:
+            print('%s\t%s' % (x.get('versionName'), x.get('versionCode')))
+
+
+def cmd_ago(iso):
+    print(ago(iso))
+
+
+cmds = {'mr': cmd_mr, 'mrs': cmd_mrs, 'jobs': cmd_jobs, 'notes': cmd_notes,
+        'pkg': cmd_pkg, 'ago': cmd_ago}
+cmds[sys.argv[1]](*sys.argv[2:])
+PYGL
+glpy() { python3 "$WORK/gl.py" "$@"; }
+
+GLAB_OK=""
+glab_ok() {  # glab_ready, asked once a run: it is a network call
+  [ -n "$GLAB_OK" ] || { if glab_ready; then GLAB_OK=1; else GLAB_OK=0; fi; }
+  [ "$GLAB_OK" = 1 ]
+}
+gl_get() {  # gl_get <api path> — logged in when possible, anonymously otherwise
+  local out=""
+  if glab_ok; then out="$(cd "$WORK" && glab api "$1" 2>/dev/null || true)"
+  elif [ -n "${GITLAB_TOKEN:-}" ]; then
+    out="$(curl -s --max-time 20 -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$GL_API/$1" || true)"
+  fi
+  [ -n "$out" ] || out="$(curl -s --max-time 20 "$GL_API/$1" || true)"
+  # nothing at all: GitLab is out of reach (a file, so pipes and $(…) see it too)
+  [ -n "$out" ] || : > "$WORK/gl.unreachable"
+  printf '%s' "$out"
+}
+vnames() {  # stdin: a metadata file — its build entries' versionNames
+  sed -nE "s/^[[:space:]]*-?[[:space:]]*versionName:[[:space:]]*['\"]?([^'\"]+)['\"]?[[:space:]]*\$/\\1/p"
+}
+# fdroid_versions <appid> — FD_PUB: what F-Droid has out, newest first (name TAB
+# code); FD_OK=0 when f-droid.org gave no answer, so nothing is concluded from it
+FD_PUB=""; FD_OK=1
+fdroid_versions() {
+  local code
+  FD_PUB=""
+  code="$(curl -s --max-time 20 -o "$WORK/pkg.json" -w '%{http_code}' "https://f-droid.org/api/v1/packages/$1" 2>/dev/null || true)"
+  case "$code" in
+    200) FD_OK=1; FD_PUB="$(glpy pkg "$WORK/pkg.json")" ;;
+    404) FD_OK=1 ;;
+    *)   FD_OK=0 ;;
+  esac
+}
+# fdroiddata_versions <appid> — FD_MASTER: the versions merged into fdroiddata's
+# master; FDD_OK=0 when GitLab gave no answer
+FD_MASTER=""; FDD_OK=1
+fdroiddata_versions() {
+  local code
+  FD_MASTER=""
+  code="$(curl -s --max-time 20 -o "$WORK/master.yml" -w '%{http_code}' \
+            "https://gitlab.com/fdroid/fdroiddata/-/raw/master/metadata/$1.yml" 2>/dev/null || true)"
+  case "$code" in
+    200) FDD_OK=1; FD_MASTER="$(vnames < "$WORK/master.yml")" ;;
+    404) FDD_OK=1 ;;
+    *)   FDD_OK=0 ;;
+  esac
+}
+mr_load() {  # mr_load <iid> — M_* for that merge request on fdroid/fdroiddata
+  gl_get "projects/fdroid%2Ffdroiddata/merge_requests/$1" > "$WORK/mr.json"
+  eval "$(glpy mr "$WORK/mr.json")"
+}
+mr_versions() {  # mr_versions <appid> — the versionNames on the loaded merge request's branch
+  gl_get "projects/$M_SRC_PID/repository/files/metadata%2F$1.yml/raw?ref=$(urlencode "$M_BRANCH")" | vnames
+}
+find_open_mr() {  # find_open_mr <appid> — '<iid> <url>' of your open merge request for it
+  local me="${GLUSER:-${SAVED_GLUSER:-}}"
+  if [ -n "$me" ]; then
+    gl_get "projects/fdroid%2Ffdroiddata/merge_requests?state=opened&author_username=$me&per_page=100" > "$WORK/mrs.json"
+  else
+    gl_get "projects/fdroid%2Ffdroiddata/merge_requests?state=opened&source_branch=$1" > "$WORK/mrs.json"
+  fi
+  glpy mrs "$WORK/mrs.json" "$1" "$me"
+}
+pipe_words() {  # pipe_words <GitLab pipeline status> — in a word
+  case "$1" in
+    success) printf 'passed' ;;
+    failed) printf 'failed' ;;
+    running|pending|created|preparing|waiting_for_resource|scheduled) printf 'running' ;;
+    canceled|canceling) printf 'canceled' ;;
+    skipped|manual) printf '%s' "$1" ;;
+    '') printf 'none yet' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+pipe_failed_jobs() {  # the loaded merge request's failed jobs, with links
+  [ -n "$M_PIPE_PID" ] && [ -n "$M_PIPE_ID" ] || return 0
+  gl_get "projects/$M_PIPE_PID/pipelines/$M_PIPE_ID/jobs?per_page=100" > "$WORK/jobs.json"
+  glpy jobs "$WORK/jobs.json" | awk -F'\t' '$1 == "failed" { printf "       ✗ %s  %s\n", $2, $3 }'
+}
+open_url() {  # open_url <url> — in the default browser; false when there is none
+  case "$(uname -s)" in Darwin) open "$1" >/dev/null 2>&1 & return 0 ;; esac
+  [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && have xdg-open || return 1
+  xdg-open "$1" >/dev/null 2>&1 &
+}
+status_words() {  # status_words <status> [pipeline] [reply] — for the task list and the timeline
+  local s="$1" p="${2-}" r="${3-0}" w
+  case "$s" in
+    started)   w="started" ;;
+    pushed)    w="pushed, no merge request yet" ;;
+    submitted) w="merge request open" ;;
+    draft)     w="draft" ;;
+    review)    w="in review" ;;
+    merged)    w="merged, waiting for F-Droid's build" ;;
+    published) w="published" ;;
+    closed)    w="merge request closed" ;;
+    *)         w="$s" ;;
+  esac
+  case "$s" in
+    draft|review|submitted)
+      [ -n "$p" ] && w="$w · pipeline $p"
+      [ "$r" = 1 ] && w="$w · reviewer replied" ;;
+  esac
+  printf '%s' "$w"
+}
+
+# app_status — this app's submission right now: printed, remembered, and what
+# changed since last time added to its timeline.
+app_status() {
+  local appid vname vcode url iid me since kind a b c d st pipe="" reply=0 pub line top=""
+  appid="$(recall ST_APPID)"; [ -n "$appid" ] || appid="$(recall APPID)"
+  vname="$(recall ST_VNAME)"; [ -n "$vname" ] || vname="$(recall VNAME)"
+  vcode="$(recall ST_VCODE)"; [ -n "$vcode" ] || vcode="$(recall VCODE)"
+  me="$(recall GLUSER)"; me="${me:-${SAVED_GLUSER:-}}"
+  step "$appid — ${vname:-?}${vcode:+ ($vcode)}"
+  [ -n "$(recall REPO)" ] && note "repo: $(recall REPO)"
+  st="$(recall ST_STATUS)"; st="${st:-started}"
+
+  fdroid_versions "$appid"; pub="$FD_PUB"
+  if [ "$FD_OK" = 0 ]; then
+    warn "could not reach f-droid.org — whether it is out was not checked"
+  elif [ -n "$vname" ] && printf '%s\n' "$pub" | cut -f1 | grep -qxF -- "$vname"; then
+    ok "$vname is out in F-Droid"; st=published
+  elif [ -n "$pub" ]; then
+    note "F-Droid has $(printf '%s\n' "$pub" | head -1 | cut -f1); ${vname:-this version} is not out yet"
+  else
+    note "not in F-Droid yet"
+  fi
+
+  url="$(recall ST_MR)"
+  if [ -z "$url" ]; then
+    line="$(find_open_mr "$appid" || true)"
+    if [ -n "$line" ]; then url="${line#* }"; remember ST_MR "$url"; tlog "found merge request $url"; fi
+  fi
+  iid="${url##*/}"
+  if [ -n "$url" ]; then
+    mr_load "$iid"
+    if [ "${M_OK:-0}" != 1 ]; then
+      # nothing new is known: keep what was, rather than log a change that wasn't
+      warn "could not reach GitLab for merge request !$iid — as it stood last time:"
+      pipe="$(recall ST_PIPE)"; reply="$(recall ST_REPLY)"; reply="${reply:-0}"
+      note "$(status_words "$st" "$pipe" "$reply") — $url"
+    else
+      case "$M_STATE" in
+        merged) ok "merge request !$iid was merged $M_MERGED"; [ "$st" = published ] || st=merged ;;
+        closed) warn "merge request !$iid was closed without merging"; st=closed ;;
+        *) if [ "$M_DRAFT" = 1 ]; then say "merge request !$iid is a draft — reviewers wait until it is ready"; st=draft
+           else ok "merge request !$iid is ready for review"; st=review; fi ;;
+      esac
+      note "$M_URL"
+      [ -n "$M_LABELS" ] && note "labels: ${M_LABELS//,/, }"
+      if [ "$M_STATE" = opened ]; then
+        pipe="$(pipe_words "$M_PIPE_STATUS")"
+        case "$pipe" in
+          passed)  ok "pipeline #$M_PIPE_ID passed $M_PIPE_WHEN" ;;
+          failed)  warn "pipeline #$M_PIPE_ID failed $M_PIPE_WHEN"; pipe_failed_jobs ;;
+          running) say "pipeline #$M_PIPE_ID is running" ;;
+          *)       note "pipeline: $pipe" ;;
+        esac
+        [ -n "$M_PIPE_URL" ] && note "$M_PIPE_URL"
+      fi
+      # what reviewers wrote since you last looked
+      since="$(recall ST_SEEN_NOTE)"
+      gl_get "projects/fdroid%2Ffdroiddata/merge_requests/$iid/notes?sort=asc&per_page=100" > "$WORK/notes.json"
+      while IFS=$'\t' read -r kind a b c d; do
+        case "$kind" in
+          ERR)   note "log in with glab to see the reviewers' comments (glab auth login)" ;;
+          TOP)   top="$a" ;;
+          REPLY) reply="$a" ;;
+          OLDER) note "$a earlier comments — all of them are on the merge request" ;;
+          NOTE)  say "${B}$b${R}, $c: $d"
+                 note "  $M_URL#note_$a"
+                 [ -n "$since" ] && tlog "comment by $b: $(printf '%s' "$d" | cut -c1-90) — $M_URL#note_$a" ;;
+        esac
+      done < <(glpy notes "$WORK/notes.json" "${since:-0}" "$me")
+      [ -n "$top" ] && [ "$top" != 0 ] && remember ST_SEEN_NOTE "$top"
+      [ "$reply" = 1 ] && [ "$M_STATE" = opened ] && warn "the last word is a reviewer's — they are waiting for you"
+    fi
+  elif [ -n "$(recall ST_BRANCH)" ]; then
+    note "branch $(recall ST_BRANCH) is on your fork, with no merge request yet (-p opens one)"
+  fi
+
+  if [ "$st" != "$(recall ST_STATUS)" ] || [ "$pipe" != "$(recall ST_PIPE)" ]; then
+    tlog "$(status_words "$st" "$pipe")${url:+ — !$iid}"
+  fi
+  remember ST_STATUS "$st"; remember ST_PIPE "$pipe"; remember ST_REPLY "$reply"
+  if [ -s "${TASK_FILE%.conf}.log" ]; then
+    say "${B}Timeline${R}"
+    tail -n 8 "${TASK_FILE%.conf}.log" | sed 's/^/     /'
+  fi
+}
+
+mr_mark() {  # mr_mark ready|draft — flip the merge request between draft and ready
+  local url iid
+  url="$(recall ST_MR)"; iid="${url##*/}"
+  [ -n "$iid" ] || return 0
+  if ! glab_ok; then
+    warn "glab is not logged in — mark it $1 on GitLab: $url"
+    return 0
+  fi
+  FDROIDDATA="${FDROIDDATA:-$(recall FDROIDDATA)}"
+  if glab_fd mr update "$iid" -R fdroid/fdroiddata "--$1" >/dev/null 2>&1; then
+    if [ "$1" = ready ]; then
+      ok "merge request !$iid is ready for review"; tlog "marked ready for review"; remember ST_STATUS review
+    else
+      ok "merge request !$iid is a draft again"; tlog "marked as a draft"; remember ST_STATUS draft
+    fi
+  else
+    warn "glab could not mark it $1 — do it on GitLab: $url"
+  fi
+}
+
+# watch_pipeline [sha] — follow the merge request's pipeline (the one for that
+# commit, when given) until it ends. Enter stops watching; the pipeline runs on.
+watch_pipeline() {
+  local url iid want="${1-}" st last="" tally rc t0=$SECONDS
+  url="$(recall ST_MR)"; iid="${url##*/}"
+  [ -n "$iid" ] || return 0
+  say "watching the pipeline — minutes to an hour; Enter stops watching (it runs on)"
+  while :; do
+    mr_load "$iid"
+    st="$(pipe_words "$M_PIPE_STATUS")"
+    [ -n "$want" ] && [ "${M_PIPE_SHA:-}" != "$want" ] && st="waiting for GitLab to start it"
+    tally=""
+    if [ -n "$M_PIPE_ID" ] && [ -n "$M_PIPE_PID" ] && [ "$st" = running ]; then
+      gl_get "projects/$M_PIPE_PID/pipelines/$M_PIPE_ID/jobs?per_page=100" > "$WORK/jobs.json"
+      tally="$(glpy jobs "$WORK/jobs.json" | sed -n 's/^TALLY\t//p')"
+    fi
+    if [ "$st $tally" != "$last" ]; then
+      printf '   %s  pipeline%s: %s%s\n' "$(date +%H:%M)" "${M_PIPE_ID:+ #$M_PIPE_ID}" "$st" "${tally:+ — $tally}"
+      last="$st $tally"
+    fi
+    case "$st" in passed|failed|canceled|skipped) break ;; esac
+    if [ $((SECONDS - t0)) -gt 7200 ]; then
+      note "still running after two hours — stopped watching; --status shows it later"; return 1
+    fi
+    if read -r -t 30 _; then
+      note "stopped watching — the pipeline runs on; --status shows it later"; return 1
+    else
+      rc=$?; [ "$rc" -gt 128 ] || sleep 30     # no terminal to read from: just wait
+    fi
+  done
+  remember ST_PIPE "$st"
+  case "$st" in
+    passed)
+      ok "the pipeline passed"; tlog "pipeline #$M_PIPE_ID passed — $M_PIPE_URL"
+      if [ "$M_DRAFT" = 1 ] && confirm "Mark the merge request ready for review now?" y; then mr_mark ready; fi ;;
+    failed)
+      warn "the pipeline failed"; tlog "pipeline #$M_PIPE_ID failed — $M_PIPE_URL"
+      pipe_failed_jobs ;;
+    *) note "the pipeline ended: $st" ;;
+  esac
+  return 0
+}
+
+failed_log() {  # the end of the first failed job's log
+  local id name url
+  [ -n "${M_PIPE_PID:-}" ] && [ -n "${M_PIPE_ID:-}" ] || { note "no pipeline to look at"; return 0; }
+  gl_get "projects/$M_PIPE_PID/pipelines/$M_PIPE_ID/jobs?per_page=100" > "$WORK/jobs.json"
+  IFS=$'\t' read -r _ name url id < <(glpy jobs "$WORK/jobs.json" | awk -F'\t' '$1 == "failed"' | head -1) || true
+  [ -n "${id:-}" ] || { note "no job failed in pipeline #$M_PIPE_ID"; return 0; }
+  say "the end of $name — $url"
+  # without colours, and without the time and stream GitLab puts before each line
+  gl_get "projects/$M_PIPE_PID/jobs/$id/trace" | sed -E 's/\x1b\[[0-9;]*[mK]//g' \
+    | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z [0-9A-Fa-f]{2}[OE]\+? ?//' | tail -n 40 | sed 's/^/     /'
+}
+
+repo_version() {  # repo_version <repo> — "name+code" as the repo says today
+  local r="$1" p g n c
+  for p in "$r/pubspec.yaml" "$r"/*/pubspec.yaml "$r"/*/*/pubspec.yaml; do
+    [ -f "$p" ] && grep -qE '^[[:space:]]+sdk:[[:space:]]*flutter' "$p" || continue
+    sed -nE "s/^version:[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\1/p" "$p" | sed -n 1p
+    return 0
+  done
+  for g in "$r/$(recall SUBDIR)/build.gradle.kts" "$r/$(recall SUBDIR)/build.gradle"; do
+    [ -f "$g" ] || continue
+    n="$(sed -nE "s/.*versionName[[:space:]]*=?[[:space:]]*[\"']([^\"']+)[\"'].*/\\1/p" "$g" | sed -n 1p)"
+    c="$(sed -nE 's/.*versionCode[[:space:]]*=?[[:space:]]*([0-9]+).*/\1/p' "$g" | sed -n 1p)"
+    [ -n "$n" ] && printf '%s+%s' "$n" "$c"
+    return 0
+  done
+}
+
+# status_menu — what this app's submission can do next. Returns to let the
+# wizard run (edit the recipe, send a version); q leaves.
+WANT_BUMP=0
+status_menu() {
+  local ch def rv rn
+  while :; do
+    rv="$(repo_version "$(recall REPO)" 2>/dev/null || true)"; rn="${rv%%+*}"
+    printf '\n'; say "${B}What next?${R}"
+    def=c
+    if [ "$(recall ST_PIPE)" = running ]; then say "  w) watch the pipeline until it ends"; def=w; fi
+    if [ "$(recall ST_STATUS)" = draft ] && [ "$(recall ST_PIPE)" = passed ]; then
+      say "  r) mark the merge request ready for review"; def=r
+    fi
+    [ "$(recall ST_STATUS)" = review ] && say "  d) mark it as a draft again"
+    [ "$(recall ST_PIPE)" = failed ] && say "  l) the end of the failed job's log"
+    [ -n "$(recall ST_MR)" ] && say "  o) open the merge request in the browser"
+    if [ -n "$rn" ] && [ "$rn" != "$(recall ST_VNAME)" ] \
+       && [ "$(printf '%s\n%s\n' "$rn" "$(recall ST_VNAME)" | sort -V | tail -1)" = "$rn" ]; then
+      say "  u) send $rn — your repo has a newer version"; def=u
+    fi
+    case "$(recall ST_STATUS)" in
+      published|merged) say "  n) release a new version: bump it in your repo"; [ "$def" = c ] && def=n ;;
+    esac
+    say "  c) continue: edit the recipe and push it again"
+    say "  q) quit"
+    printf '   %sChoice%s [%s]: ' "$B" "$R" "$def" >&2
+    readline ch; ch="${ch:-$def}"
+    case "$ch" in
+      w|W) watch_pipeline || true; app_status ;;
+      r|R) mr_mark ready; app_status ;;
+      d|D) mr_mark draft; app_status ;;
+      l|L) failed_log ;;
+      o|O) open_url "$(recall ST_MR)" || say "$(recall ST_MR)" ;;
+      u|U|c|C) return 0 ;;
+      n|N) WANT_BUMP=1; return 0 ;;
+      q|Q) exit 0 ;;
+      *) warn "one of the letters above" ;;
+    esac
+  done
 }
 
 existing_mr() {
@@ -802,11 +1319,13 @@ open_mr_for_task() {
     fi
     MR_OUT="$(glab_fd mr create -R fdroid/fdroiddata -H "$head" \
                 -s "$BRANCH" -b "$UPBRANCH" -t "$title" \
-                -d "$(cat "$body")" --allow-collaboration -y 2>&1 || true)"
+                -d "$(cat "$body")" --allow-collaboration --draft -y 2>&1 || true)"
     MR_URL="$(printf '%s\n' "$MR_OUT" | grep -Eo 'https://[^ ]+/-/merge_requests/[0-9]+' | tail -1 || true)"
     if [ -n "$MR_URL" ]; then
-      ok "merge request: $MR_URL"
-      remember ST_MR "$MR_URL"; remember ST_STATUS submitted
+      ok "merge request, as a draft until its pipeline passes: $MR_URL"
+      remember ST_MR "$MR_URL"; remember ST_STATUS draft
+      tlog "merge request !${MR_URL##*/} opened as a draft"
+      note "follow it, and mark it ready once the pipeline passes: fdroid-submit.sh --status $APPID"
       return 0
     fi
     warn "glab did not open it:"
@@ -821,14 +1340,31 @@ open_mr_for_task() {
 
 if [ "$PR_ONLY" = 1 ]; then
   migrate_tasks
-  step "Tasks with a branch on your fork"
-  note "pushed: no merge request yet — submitted: one is open and can be re-described"
-  if ! pick_task pushed-or-submitted; then
+  migrate_per_app
+  step "Apps with a branch on your fork"
+  note "no merge request yet: one is opened — one open: its description is renewed"
+  if ! pick_task with-branch; then
     say "nothing opened: no task with a pushed branch was picked."
     note "tasks live in $TASK_DIR"
     exit 0
   fi
   open_mr_for_task
+  exit 0
+fi
+
+# --status: each app's submission as it stands, nothing else
+if [ "$STATUS_ONLY" = 1 ]; then
+  migrate_tasks
+  migrate_per_app
+  N_APPS=0
+  for f in $(ls -t "$TASK_DIR/$STORE_ID"-*.conf 2>/dev/null || true); do
+    id="$(basename "$f" .conf)"; id="${id#"$STORE_ID"-}"
+    [ -z "$STATUS_APP" ] || [ "$id" = "$STATUS_APP" ] || continue
+    MEM=(); TASK_FILE="$f"; read_task "$f"
+    app_status
+    N_APPS=$((N_APPS + 1))
+  done
+  [ "$N_APPS" -gt 0 ] || say "no task${STATUS_APP:+ for $STATUS_APP} yet — a first run of the wizard makes one"
   exit 0
 fi
 
@@ -852,10 +1388,15 @@ BANNER
 IS_UPDATE=0
 
 migrate_tasks
-# Pick up an earlier task, if there is one: its answers become this run's
-# defaults, so continuing where you stopped needs no retyping.
+migrate_per_app
+# Pick up an app's task, if there is one: where its submission stands is shown
+# first — the merge request, the pipeline, the reviewers, F-Droid — then what
+# can happen next; its answers become this run's defaults.
 if [ "$PR_ONLY" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -d "$TASK_DIR" ]; then
-  pick_task || true
+  if pick_task; then
+    app_status
+    status_menu
+  fi
 fi
 
 detect_runner
@@ -863,15 +1404,21 @@ detect_runner
 # ============================================================== 1. the app repo
 step "1/5  Your app repository"
 
-# The app repo: --repo, else the git repo you run this from (unless that's
-# this script's own), else the one from last time.
+# The app repo: --repo; the task's own, when continuing one; otherwise asked —
+# a new task is a new app, so last time's repo is no answer for it — with the
+# git repo you run this in (unless it is this script's own) as the default.
 SELF_REPO="$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || true)"
 HERE_REPO="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 [ "$HERE_REPO" = "$SELF_REPO" ] && HERE_REPO=""
-REPO_GUESS="${REPO_ARG:-${HERE_REPO:-${SAVED_REPO:-}}}"
+REPO_GUESS="$HERE_REPO"
+[ "$ASSUME_YES" = 1 ] && REPO_GUESS="${REPO_GUESS:-${SAVED_REPO:-}}"
 while :; do
   if [ -n "$REPO_ARG" ]; then REPO="$REPO_ARG"
-  else auto REPO "App repository" "$REPO_GUESS"; fi
+  elif [ -n "$TASK_FILE" ] && [ -n "$(recall REPO)" ]; then auto REPO "App repository" "$(recall REPO)"
+  else
+    [ -z "$REPO_GUESS" ] && note "the app's git checkout, e.g. ~/Projects/MyApp — run this inside it to skip the question"
+    ask REPO "App repository" "$REPO_GUESS"
+  fi
   REPO="${REPO/#\~/$HOME}"
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] && break
   [ -n "$REPO_ARG" ] && die "$REPO is not a git checkout"
@@ -987,22 +1534,76 @@ while :; do
                                 warn "versionCode must be a plain integer"; VCODE_GUESS="" ;; *) break ;; esac
 done
 
-# A task is one store, one app, one version: from here on every answer and every
-# milestone belongs to it. It can only be named now, since the version is part of
-# the name — a new version is a new task, and a new branch in the fork.
+# The app's task: one for every version it ever sends, so it can only be named
+# now that the application id is known.
 state_load
-if done_with TAG || done_with BRANCH || done_with MR || done_with RELEASE; then
-  step "Where you left off"
-  note "task: $(basename "${TASK_FILE%.conf}")"
-  if done_with RUN;     then note "last run: $(recall ST_RUN)"; fi
-  if done_with TAG;     then ok "tag pushed: $(recall ST_TAG)"; fi
-  if done_with BRANCH;  then ok "branch on your fork: $(recall ST_BRANCH)"; fi
-  if done_with MR;      then ok "merge request: $(recall ST_MR)"; fi
-  if done_with RELEASE; then ok "release published: $(recall ST_RELEASE)"; fi
-  note "each question below offers last time's answer; Enter keeps it"
-  note "anything already done is checked, not repeated — and can be redone"
-fi
 remember ST_RUN "$(date '+%Y-%m-%d %H:%M')"
+
+# --- where this version stands: out in F-Droid already, merged into
+# fdroiddata, waiting in your merge request — or new. A version F-Droid has
+# cannot go out again; a newer one is an update; one in your merge request is
+# followed there.
+STOOD=new; BUMP_OFFER=1
+stands_check() {
+  local pub master iid="" line mrv="" latest ch
+  say "where $VNAME stands…"
+  rm -f "$WORK/gl.unreachable"
+  fdroid_versions "$APPID"; pub="$FD_PUB"
+  fdroiddata_versions "$APPID"; master="$FD_MASTER"
+  if [ -n "$(recall ST_MR)" ]; then
+    iid="$(recall ST_MR)"; iid="${iid##*/}"; mr_load "$iid"
+    [ "${M_OK:-0}" = 1 ] && [ "$M_STATE" = opened ] || iid=""
+  fi
+  if [ -z "$iid" ]; then
+    line="$(find_open_mr "$APPID" || true)"
+    if [ -n "$line" ]; then iid="${line%% *}"; mr_load "$iid"; remember ST_MR "${line#* }"; fi
+  fi
+  [ -n "$iid" ] && [ "${M_OK:-0}" = 1 ] && mrv="$(mr_versions "$APPID" || true)"
+  latest="$(printf '%s\n' "$pub" | head -1 | cut -f1)"
+  # what could not be looked at is said, not guessed
+  [ "$FD_OK" = 0 ] && warn "could not reach f-droid.org — whether $VNAME is already out was not checked"
+  { [ "$FDD_OK" = 0 ] || [ -f "$WORK/gl.unreachable" ]; } && \
+    warn "could not reach GitLab — fdroiddata and your merge requests were not checked"
+  if printf '%s\n' "$pub" | cut -f1 | grep -qxF -- "$VNAME"; then
+    warn "$APPID $VNAME is already out in F-Droid — it cannot be sent again"
+    STOOD=published
+  elif printf '%s\n' "$master" | grep -qxF -- "$VNAME"; then
+    warn "$VNAME is merged into fdroiddata already — F-Droid's build server publishes it within a day or two"
+    STOOD=merged
+  elif [ -n "$mrv" ] && printf '%s\n' "$mrv" | grep -qxF -- "$VNAME"; then
+    ok "$VNAME is in your merge request !$iid already — $M_URL"
+    STOOD=in-mr
+  elif [ -n "$pub$master" ]; then
+    ok "F-Droid has ${latest:-$(printf '%s\n' "$master" | tail -1)}; $VNAME is new — an update"
+    STOOD=update
+  else
+    if [ -n "$iid" ]; then ok "your merge request !$iid is open, for $(printf '%s' "$mrv" | tr '\n' ' ')— $VNAME goes into it"
+    elif [ "$FD_OK" = 0 ] || [ "$FDD_OK" = 0 ] || [ -f "$WORK/gl.unreachable" ]; then
+      note "taking $APPID as a new app — that could not be checked"
+    else ok "$APPID is not in F-Droid yet — a new app"; fi
+    STOOD=new
+  fi
+  case "$STOOD" in
+    published|merged)
+      [ "$ASSUME_YES" = 1 ] && die "$VNAME is already $STOOD — bump the version in your repo first"
+      say "  n) release a new version: bump it in your repo"
+      say "  s) stop here"
+      ask STAND_CH "Which" "n"
+      case "$STAND_CH" in n|N*) WANT_BUMP=1 ;; *) exit 0 ;; esac ;;
+    in-mr)
+      [ "$ASSUME_YES" = 1 ] && return 0
+      say "  c) continue: update the recipe in that merge request"
+      say "  n) release a newer version: bump it in your repo"
+      say "  s) stop here — --status follows the merge request"
+      ask STAND_CH "Which" "c"
+      # carrying on with what the merge request holds: commits made after the
+      # tag (a description fix, say) are no call for a new version
+      case "$STAND_CH" in n|N*) WANT_BUMP=1 ;; s|S*) exit 0 ;; *) BUMP_OFFER=0 ;; esac ;;
+    update)
+      confirm "Send $VNAME to F-Droid as an update?" y || exit 0 ;;
+  esac
+}
+[ "$WANT_BUMP" = 1 ] || stands_check
 
 # --- tag: F-Droid builds the tag — so it must exist, be pushed, and hold
 # exactly this application ID and version. The wizard sorts that out itself.
@@ -1129,10 +1730,17 @@ LASTTAG="$(git -C "$REPO" describe --tags --abbrev=0 2>/dev/null || true)"
 AHEAD=0
 [ -n "$LASTTAG" ] && AHEAD="$(git -C "$REPO" rev-list --count "$LASTTAG..HEAD" 2>/dev/null || echo 0)"
 
-if [ "$CUR_TAGGED" = 1 ] && [ "$AHEAD" -gt 0 ] && [ -n "$VER_FILE" ] && [ "$DRYRUN" = 0 ]; then
+BUMP=0
+if [ "$WANT_BUMP" = 1 ]; then
+  [ -n "$VER_FILE" ] || die "the version is not in a pubspec.yaml or gradle file this wizard can edit — bump it by hand, commit, and run again"
+  if [ "$DRYRUN" = 1 ]; then warn "dry run — not bumping the version"; else BUMP=1; fi
+elif [ "$BUMP_OFFER" = 1 ] && [ "$CUR_TAGGED" = 1 ] && [ "$AHEAD" -gt 0 ] && [ -n "$VER_FILE" ] && [ "$DRYRUN" = 0 ]; then
   warn "$AHEAD commit(s) since $LASTTAG, but ${VER_FILE#"$REPO"/} still says $VNAME+$VCODE"
   note "that version is already tagged, so those commits cannot be released as it"
-  if confirm "Bump the version and make the release commit?" n; then
+  confirm "Bump the version and make the release commit?" n && BUMP=1
+fi
+if [ "$BUMP" = 1 ]; then
+  if :; then
     ask NEW_VNAME "New versionName" "$(next_vname "$VNAME")"
     ask NEW_VCODE "New versionCode" "$((VCODE + 1))"
 
@@ -1193,6 +1801,37 @@ if [ "$CUR_TAGGED" = 1 ] && [ "$AHEAD" -gt 0 ] && [ -n "$VER_FILE" ] && [ "$DRYR
       warn "reverted the version bump; the changelog files are left in place"
     fi
   fi
+fi
+
+# --- this run's version, in the app's one task. A new version starts its own
+# build entry: the previous one's line answers are no defaults for it. A
+# finished submission — merged, published, closed — becomes history, and this
+# version gets a merge request of its own; an open one carries it instead.
+LAST_VCODE="$(recall ST_VCODE)"
+if [ -n "$LAST_VCODE" ] && [ "$LAST_VCODE" != "$VCODE" ]; then
+  tlog "version $(recall ST_VNAME) ($LAST_VCODE) → $VNAME ($VCODE)"
+  for k in "${!MEM[@]}"; do
+    case "$k" in Y_b_*|Y_top_CurrentVersion|Y_top_CurrentVersionCode|Y_BASE|ST_TAG|ST_RELEASE) unset "MEM[$k]" ;; esac
+  done
+  case "$(recall ST_STATUS)" in
+    merged|published|closed)
+      tlog "a new submission: $VNAME"
+      for k in ST_MR ST_BRANCH ST_STATUS ST_PIPE ST_REPLY ST_SEEN_NOTE ST_COMMITMSG; do unset "MEM[$k]"; done ;;
+  esac
+  state_save
+fi
+remember ST_VNAME "$VNAME"; remember ST_VCODE "$VCODE"
+[ -n "$(recall ST_STATUS)" ] || remember ST_STATUS started
+if done_with TAG || done_with BRANCH || done_with MR || done_with RELEASE; then
+  step "Where you left off"
+  note "task: $(basename "${TASK_FILE%.conf}")"
+  if done_with RUN;     then note "last run: $(recall ST_RUN)"; fi
+  if done_with TAG;     then ok "tag pushed: $(recall ST_TAG)"; fi
+  if done_with BRANCH;  then ok "branch on your fork: $(recall ST_BRANCH)"; fi
+  if done_with MR;      then ok "merge request: $(recall ST_MR)"; fi
+  if done_with RELEASE; then ok "release published: $(recall ST_RELEASE)"; fi
+  note "each question below offers last time's answer; Enter keeps it"
+  note "anything already done is checked, not repeated — and can be redone"
 fi
 
 # Prefer an existing v<version> or <version> tag; else the usual v<version>.
@@ -3863,6 +4502,8 @@ if ! git -C "$FDROIDDATA" push -f -u origin "$BRANCH"; then
   die "push failed"
 fi
 ok "pushed $BRANCH ($((SECONDS - PUSH_T0))s)"
+PUSHED_SHA="$(git -C "$FDROIDDATA" rev-parse HEAD)"
+tlog "pushed $VNAME ($VCODES) to $BRANCH on your fork"
 # Everything the merge request needs later, so `-p` can open it on its own —
 # including the description, which is built from things only this run knows.
 remember ST_BRANCH "$BRANCH"
@@ -3885,20 +4526,27 @@ if [ -n "$MR_OPEN" ]; then
   ok "a merge request from $BRANCH is already open — the push above updated it"
   ok "$MR_URL"
   remember ST_MR "$MR_URL"; remember ST_STATUS submitted
+  tlog "merge request !${MR_URL##*/} updated with $VNAME"
   note "CI re-runs on the new commit"
   if [ -n "$TASK_FILE" ]; then
     mr_description > "${TASK_FILE%.conf}.mr.md" 2>/dev/null || true
     sync_mr_description "$MR_URL" "${TASK_FILE%.conf}.mr.md"
   fi
-elif glab_ready && go "Open the merge request on fdroid/fdroiddata?"; then
+  # a draft while the new pipeline runs, so nobody reviews a half-checked change
+  mr_load "${MR_URL##*/}"
+  if [ "${M_DRAFT:-0}" = 0 ] && glab_ok && go "Make it a draft until the new pipeline passes?"; then
+    mr_mark draft
+  fi
+elif glab_ready && go "Open the merge request on fdroid/fdroiddata (as a draft until its pipeline passes)?"; then
   mr_description > "$WORK/mr.md"
   MR_OUT="$(glab_fd mr create -R fdroid/fdroiddata -H "$(fork_path "$FORKURL")" \
               -s "$BRANCH" -b "$UPBRANCH" -t "$COMMITMSG" \
-              -d "$(cat "$WORK/mr.md")" --allow-collaboration -y 2>&1 || true)"
+              -d "$(cat "$WORK/mr.md")" --allow-collaboration --draft -y 2>&1 || true)"
   MR_URL="$(printf '%s\n' "$MR_OUT" | grep -Eo 'https://[^ ]+/-/merge_requests/[0-9]+' | tail -1 || true)"
   if [ -n "$MR_URL" ]; then
-    ok "merge request: $MR_URL"
-    remember ST_MR "$MR_URL"; remember ST_STATUS submitted
+    ok "merge request, a draft for now: $MR_URL"
+    remember ST_MR "$MR_URL"; remember ST_STATUS draft
+    tlog "merge request !${MR_URL##*/} opened as a draft ($VNAME)"
   else
     warn "glab did not open the merge request:"
     printf '%s\n' "$MR_OUT" | tail -5 | sed 's/^/       /'
@@ -3912,8 +4560,18 @@ if [ -z "$MR_URL" ]; then
   [ -n "$RFP_REF" ] && MRURL="$MRURL&merge_request%5Bdescription%5D=$(urlencode "Closes $RFP_REF")"
   say "${B}Open the merge request:${R} $MRURL"
   note "target fdroid/fdroiddata, branch $UPBRANCH, title \"$COMMITMSG\""
+  note "tick \"Mark as draft\" — it comes out of draft once its pipeline passes"
 fi
 [ -n "$RFP_REF" ] && note "it links the RFP issue ($RFP_REF)"
+
+# --- the pipeline, then the reviewers. A draft is not reviewed: it comes out
+# of draft once fdroiddata's pipeline has passed on this very commit.
+if [ -n "$MR_URL" ]; then
+  if go "Watch the pipeline now and mark the merge request ready once it passes?"; then
+    watch_pipeline "$PUSHED_SHA" || true
+  fi
+  note "follow it from here on, with the reviewers' comments: fdroid-submit.sh --status $APPID"
+fi
 note "expect roughly 24-48 hours from merge until the app appears in F-Droid"
 }
 
