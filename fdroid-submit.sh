@@ -2000,6 +2000,29 @@ esac
 # ----------------------------------------------------- 1b. common MR blockers
 step "Pitfall check"
 BLOCKERS=0
+
+# F-Droid builds only from source anyone can clone — and reviewers read it.
+# Asked of the forge's API anonymously: a private repo answers 404 there.
+public_check() {
+  local path api="" code
+  case "$WEB_GUESS" in
+    https://github.com/*)   path="${WEB_GUESS#https://github.com/}"; api="https://api.github.com/repos/$path" ;;
+    https://gitlab.com/*)   path="${WEB_GUESS#https://gitlab.com/}"
+                            api="https://gitlab.com/api/v4/projects/$(printf '%s' "$path" | sed 's#/#%2F#g')" ;;
+    https://codeberg.org/*) path="${WEB_GUESS#https://codeberg.org/}"; api="https://codeberg.org/api/v1/repos/$path" ;;
+    *) return 0 ;;
+  esac
+  have curl || return 0
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$api" 2>/dev/null || true)"
+  case "$code" in
+    200) ok "the source is public: $WEB_GUESS" ;;
+    404) warn "$WEB_GUESS is not public — F-Droid builds only from source anyone can clone"
+         note "make the repository public before submitting; its tags and releases come with it"
+         BLOCKERS=$((BLOCKERS+1)) ;;
+    *)   note "could not check whether $WEB_GUESS is public (HTTP ${code:-none})" ;;
+  esac
+}
+public_check
 PROPRIETARY_PUB=""
 
 # Binaries committed to the repo: F-Droid builds from source only.
@@ -3406,7 +3429,10 @@ if [ -n "$FLUTTER_DIR" ]; then
   # whatever the app already has in F-Droid.
   ABISPLIT=1
   if [ "$IS_UPDATE" = 0 ]; then
-    confirm "Build one APK per CPU type (smaller downloads; F-Droid asks for it)?" y || ABISPLIT=0
+    if ! confirm "Build one APK per CPU type (smaller downloads; F-Droid asks for it)?" y; then
+      ABISPLIT=0
+      warn "one APK for every CPU type: F-Droid's reviewers ask Flutter apps to split it — expect that request"
+    fi
   fi
   [ "$ABISPLIT" = 1 ] && ok "one APK per CPU type: armeabi-v7a, arm64-v8a, x86_64"
   if [ "$ABISPLIT" = 1 ] && ! grep -q 'versionCodeOverride' "$GRADLE_FILE" 2>/dev/null; then
@@ -3885,8 +3911,40 @@ ask_publishing() {
         die "build the APK you publish at F-Droid's path first, then re-run"
     fi
   fi
-  ask SIGNKEY "AllowedAPKSigningKeys (SHA-256, lowercase hex)" "$SIGNKEY"
+  # 64 hex characters. apksigner and keytool print it in capitals or with
+  # colons, which F-Droid does not take: cleaned up here. Anything else is
+  # asked again, and a wrong one is never remembered as next time's default.
+  sigclean() { printf '%s' "$1" | tr -d ': ' | tr 'A-F' 'a-f'; }
+  sigok() { printf '%s' "$1" | grep -qE '^[0-9a-f]{64}$'; }
+  SIGNKEY="$(sigclean "$SIGNKEY")"
+  sigok "$SIGNKEY" || SIGNKEY="$(sigclean "$(recall SIGNKEY)")"
+  sigok "$SIGNKEY" || { SIGNKEY=""; remember SIGNKEY ""; }
+  while :; do
+    ask SIGNKEY "AllowedAPKSigningKeys (the certificate's SHA-256: 64 hex characters)" "$SIGNKEY"
+    SIGNKEY="$(sigclean "$SIGNKEY")"
+    sigok "$SIGNKEY" && break
+    remember SIGNKEY ""
+    [ "$ASSUME_YES" = 1 ] && die "AllowedAPKSigningKeys has to be 64 hex characters"
+    warn "that is not a SHA-256 fingerprint: it is 64 hex characters (0-9, a-f)"
+    note "read it off your signed release APK: apksigner verify --print-certs app.apk"
+    note "(the \"SHA-256 digest\" line), or keytool -printcert -jarfile app.apk"
+    SIGNKEY=""
+  done
+  remember SIGNKEY "$SIGNKEY"
   rset top/AllowedAPKSigningKeys l "$SIGNKEY"
+  # F-Droid downloads this APK to compare its own build with, so check that it
+  # is really there for this version — a missing asset, a name that differs
+  # from the pattern, or a private repo all fail the reproducible-build check.
+  binary_there() {  # binary_there <url> — say whether the APK can be downloaded
+    local code
+    code="$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 20 "$1" 2>/dev/null || true)"
+    case "$code" in
+      200) ok "found the APK: $1" ;;
+      404) warn "no APK at $1"
+           note "upload the signed APK to the release, or fix the pattern — F-Droid needs to download it" ;;
+      *)   note "could not check $1 (HTTP ${code:-none})" ;;
+    esac
+  }
   # Binaries: is one app-level pattern and only knows %v and %c, so it cannot
   # name per-ABI release assets. fdroidserver takes `build.binary or
   # app.Binaries`, so with a split each entry carries its own binary: line.
@@ -3897,10 +3955,12 @@ ask_publishing() {
              | grep -oE 'armeabi-v7a|arm64-v8a|x86_64|x86' | sed -n 1p || true)"
       b="$BINARIES"; [ -n "$abi" ] && b="${b//%abi/$abi}"
       printf '%s\n' "$b" > "$RT/b/$n/binary"; echo s > "$RT/b/$n/binary.k"
+      b="${b//%v/$VNAME}"; binary_there "${b//%c/$(fv "$RT/b/$n/versionCode")}"
     done
     ok "each build entry points at its own APK on the release page"
   else
     rset top/Binaries s "$BINARIES"
+    b="${BINARIES//%v/$VNAME}"; binary_there "${b//%c/$VCODE}"
     for n in $(seq 1 "$K"); do rm -f "$RT/b/$n/binary" "$RT/b/$n/binary.k"; done
   fi
 }
