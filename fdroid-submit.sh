@@ -799,6 +799,11 @@ SHIM
 # GIT_CONFIG_GLOBAL, so these two still land.
 fd_in() {
   local envs=()
+  # gradlew-fdroid downloads gradle into its own folder, which a packaged copy
+  # (Nix: /etc/profiles…) cannot write to; give it one that it can
+  if [ -z "${GRADLE_VERSION_DIR:-}" ]; then
+    envs+=("GRADLE_VERSION_DIR=${TOOLS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/fdroid-submit}/gradle-versions")
+  fi
   [ -n "$GIT_CFG_OFF" ] && envs+=("GIT_CONFIG_GLOBAL=/dev/null")
   [ -n "$GIT_REAL_FALSE" ] && envs+=("GIT_SSH_COMMAND=$GIT_REAL_FALSE")
   ( cd "$FDROIDDATA" && PATH="${GIT_SHIM:+$GIT_SHIM:}$PATH" \
@@ -4404,6 +4409,10 @@ build_release_apks() {
   fi
   BUILT_APKS="$keep"
   [ -n "$BUILT_APKS" ] || { warn "the build left no fitting APK in ${out#"$REPO"/}"; return 1; }
+  if [ -z "$(apk_cert "$(printf '%s\n' "$BUILT_APKS" | sed -n 1p)")" ]; then
+    warn "the build is unsigned: your build files do not sign releases on this machine"
+    sign_built_apks || { note "sign it yourself and put it on the release"; return 1; }
+  fi
   ok "built:"
   while IFS= read -r f; do
     s="$(apk_cert "$f")"; vc="$(apk_vcode "$f")"
@@ -4436,10 +4445,69 @@ build_release_apks() {
 # app_builds_dir — the builds/ folder of the app's project, when its repo lives
 # in a <project>/branches/<branch> layout: signed builds are kept there, where
 # they are easy to find
-app_builds_dir() {
+app_project_dir() {  # <project> of a repo in a <project>/branches/<branch> layout
   local parent
   parent="$(dirname "$REPO")"
-  if [ "$(basename "$parent")" = branches ]; then printf '%s/builds' "$(dirname "$parent")"; fi
+  if [ "$(basename "$parent")" = branches ]; then dirname "$parent"; fi
+}
+app_builds_dir() {
+  local p; p="$(app_project_dir)"
+  if [ -n "$p" ]; then printf '%s/builds' "$p"; fi
+}
+
+# app_keystores — release keystores this app may be signed with: the one a
+# key.properties names, and any in the project's secrets/ folder
+app_keystores() {
+  local kp store p f
+  while IFS= read -r kp; do
+    [ -n "$kp" ] || continue
+    store="$(sed -nE 's/^[[:space:]]*storeFile[[:space:]]*=[[:space:]]*//p' "$kp" | sed -n 1p | tr -d '\r')"
+    store="${store/#\~/$HOME}"
+    for f in "$store" "$(dirname "$kp")/app/$store" "$(dirname "$kp")/$store"; do
+      case "$f" in /*) if [ -f "$f" ]; then printf '%s\n' "$f"; break; fi ;; esac
+    done
+  done < <(key_props)
+  p="$(app_project_dir)"
+  if [ -n "$p" ] && [ -d "$p/secrets" ]; then
+    find "$p/secrets" -maxdepth 2 -type f \( -name '*.jks' -o -name '*.keystore' -o -name '*.p12' \) 2>/dev/null
+  fi
+}
+
+# sign_built_apks — BUILT_APKS came out unsigned (the project signs releases by
+# hand): sign them with your release keystore, as you would yourself. The
+# password is asked for, used once and never kept.
+sign_built_apks() {
+  local stores=() ks pw alias f out signed=""
+  have apksigner || { warn "apksigner (Android build-tools) is needed to sign them"; return 1; }
+  while IFS= read -r ks; do
+    if [ -n "$ks" ]; then stores+=("$ks"); fi
+  done < <(app_keystores | awk '!seen[$0]++')
+  say "Sign it with your release key here? F-Droid compares its own build with your signed APK."
+  stores+=("another keystore — give its path")
+  pick SIGN_KS 1 "${stores[@]}"
+  ks="${stores[$((SIGN_KS - 1))]}"
+  if [ "$SIGN_KS" = "${#stores[@]}" ]; then
+    ask KEYSTORE "Path to your release keystore" ""
+    ks="${KEYSTORE/#\~/$HOME}"
+  fi
+  [ -f "$ks" ] || { warn "no such file: $ks"; return 1; }
+  printf '   %sPassword of %s%s (not shown, not kept): ' "$B" "${ks##*/}" "$R" >&2
+  IFS= read -rs pw || true; printf '\n' >&2
+  alias="$(FD_KS_PASS="$pw" keytool -list -keystore "$ks" -storepass:env FD_KS_PASS 2>/dev/null \
+           | awk -F', ' '/PrivateKeyEntry/ {print $1; exit}')"
+  [ -n "$alias" ] || { warn "could not open ${ks##*/} — a wrong password?"; return 1; }
+  mkdir -p "$WORK/signed"
+  while IFS= read -r f; do
+    out="$WORK/signed/$(basename "${f%-unsigned.apk}")"; out="${out%.apk}.apk"
+    if ! FD_KS_PASS="$pw" apksigner sign --ks "$ks" --ks-key-alias "$alias" --ks-pass env:FD_KS_PASS \
+         --key-pass env:FD_KS_PASS --out "$out" "$f" >/dev/null 2>&1; then
+      warn "apksigner could not sign ${f##*/}"; return 1
+    fi
+    rm -f "$out.idsig"
+    signed="${signed:+$signed$'\n'}$out"
+  done <<< "$BUILT_APKS"
+  BUILT_APKS="$signed"
+  ok "signed with ${ks##*/} ($alias)"
 }
 
 # upload_release_apks — BUILT_APKS onto release $TAG, named as Binaries says
@@ -4502,7 +4570,7 @@ local_apks() {  # release APKs in this repo's build folders, newest first
   local d
   for d in ${FLUTTER_DIR:+"$REPO/$FLUTTER_DIR/build/app/outputs"} "$REPO/$SUBDIR/build/outputs" \
            "$REPO/build" "$REPO/dist" "$REPO/release" "$REPO/releases"; do
-    if [ -d "$d" ]; then find "$d" -name '*.apk' -not -iname '*debug*' -printf '%T@ %p\n' 2>/dev/null; fi
+    if [ -d "$d" ]; then find "$d" -name '*.apk' -not -iname '*debug*' -not -iname '*unsigned*' -printf '%T@ %p\n' 2>/dev/null; fi
   done | sed 's#/\./#/#g' | sort -rn | awk '{ sub(/^[^ ]+ /, ""); if (!seen[$0]++) print }' | head -4
 }
 key_props() {  # the properties files your gradle build reads its release keystore from
@@ -5390,7 +5458,14 @@ else
     if grep -Fq "$APPID" "$WORK/readmeta.log"; then
       VALID_FAIL="$VALID_FAIL readmeta"; chk "fdroid readmeta" "failed: it cannot read metadata/$APPID.yml"
     else
-      note "another app's recipe trips it, not $APPID — nothing for you to fix"
+      RM_OTHER="$(grep -oE ' in [A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+' "$WORK/readmeta.log" | sed -n '1s/ in //p' || true)"
+      if [ -n "$RM_OTHER" ] && [ -f "$FDROIDDATA/metadata/$RM_OTHER.yml" ] \
+         && ! git -C "$FDROIDDATA" ls-files --error-unmatch "metadata/$RM_OTHER.yml" >/dev/null 2>&1; then
+        note "it is metadata/$RM_OTHER.yml, left untracked in your clone (an earlier run?) — not part of this merge request"
+        note "delete it when you no longer need it: rm $FDROIDDATA/metadata/$RM_OTHER.yml"
+      else
+        note "another app's recipe trips it, not $APPID — nothing for you to fix"
+      fi
       chk "fdroid readmeta" "passed: (another app's recipe trips it, not yours)"
     fi
   fi
@@ -5468,8 +5543,10 @@ else
   elif [ "$RUN_BUILD" = 1 ] || { [ "$ASSUME_YES" = 0 ] \
        && note "the full build takes 10 minutes to an hour; sudo: lines are skipped outside F-Droid's build server" \
        && confirm "Run it here too (fdroid build)?" n; }; then
-    say "fdroid build -v -l $APPID"
-    if frun build -v -l "$APPID"; then
+    say "fdroid build --stop -v -l $APPID"
+    # without --stop it reports "1 build failed" and still exits 0
+    if frun build --stop -v -l "$APPID" 2>&1 | tee "$WORK/build.log" \
+       && ! grep -qE '[0-9]+ builds? failed|Could not build app' "$WORK/build.log"; then
       chk "fdroid build" passed
     else
       warn "the build failed — F-Droid's pipeline would fail the same way"
@@ -5680,7 +5757,12 @@ if [ "$DRYRUN" = 1 ]; then
   if [ -z "$CHK_FAILED" ]; then ok "run it again without --dry-run to send it"; fi
   exit 0
 fi
-if ! go "Commit and push to $FORKURL ($BRANCH)?"; then
+PUSH_DEF=y
+if [ -n "${CHK_FAILED:-}" ]; then
+  warn "the checks above failed on: $CHK_FAILED — the pipeline will fail the same way"
+  PUSH_DEF=n
+fi
+if { [ "$ASSUME_YES" = 1 ] && [ "$PUSH_DEF" = n ]; } || ! confirm "Commit and push to $FORKURL ($BRANCH)?" "$PUSH_DEF"; then
   say "Nothing pushed. The branch and file are ready at:"
   note "$FDROIDDATA (branch $BRANCH)"
   exit 0
