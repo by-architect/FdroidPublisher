@@ -1141,7 +1141,7 @@ app_status() {
         case "$pipe" in
           passed)  ok "pipeline #$M_PIPE_ID passed $M_PIPE_WHEN" ;;
           failed)  warn "pipeline #$M_PIPE_ID failed $M_PIPE_WHEN"; pipe_failed_jobs ;;
-          running) say "pipeline #$M_PIPE_ID is running" ;;
+          running) say "pipeline #$M_PIPE_ID is running"; runners_check ;;
           *)       note "pipeline: $pipe" ;;
         esac
         [ -n "$M_PIPE_URL" ] && note "$M_PIPE_URL"
@@ -1197,6 +1197,36 @@ mr_mark() {  # mr_mark ready|draft — flip the merge request between draft and 
   fi
 }
 
+# runners_check — a pipeline that never starts. Merge request pipelines run in
+# your fork, on GitLab's shared ("instance") runners; with those switched off
+# for the fork, every job waits for a runner forever. Says so, and offers to
+# switch them back on. Reading the setting needs a login (glab).
+RUNNERS_SAID=""
+runners_check() {
+  local on json path
+  [ -n "${M_PIPE_PID:-}" ] && [ -z "$RUNNERS_SAID" ] && glab_ok || return 0
+  json="$(gl_get "projects/$M_PIPE_PID")"
+  on="$(printf '%s' "$json" | json_bool shared_runners_enabled)"
+  path="$(printf '%s' "$json" | json_str path_with_namespace)"
+  [ "$on" = false ] || return 0
+  RUNNERS_SAID=1
+  warn "your fork has GitLab's shared runners switched off — no job of this pipeline can start"
+  note "merge request pipelines run in your fork, on GitLab's instance runners"
+  note "the setting: https://gitlab.com/${path:-<you>/fdroiddata}/-/settings/ci_cd (Runners → Instance runners)"
+  if go "Switch the instance runners on for your fork?"; then
+    if glab_fd api --method PUT "projects/$M_PIPE_PID" -f shared_runners_enabled=true >/dev/null 2>&1; then
+      ok "instance runners on — the waiting jobs start as soon as a runner takes them"
+      tlog "switched the fork's instance runners on"
+    else
+      warn "GitLab refused — switch them on in the settings page above"
+      note "a new GitLab account may first have to verify itself (phone or card) to use them"
+    fi
+  fi
+}
+json_bool() {  # json_bool <key> — true/false of the first "key": true|false in the JSON on stdin
+  grep -Eo "\"$1\"[[:space:]]*:[[:space:]]*(true|false)" | sed -n 1p | sed -E 's/.*:[[:space:]]*//'
+}
+
 # watch_pipeline [sha] — follow the merge request's pipeline (the one for that
 # commit, when given) until it ends. Enter stops watching; the pipeline runs on.
 watch_pipeline() {
@@ -1218,6 +1248,7 @@ watch_pipeline() {
       last="$st $tally"
     fi
     case "$st" in passed|failed|canceled|skipped) break ;; esac
+    [ "$st" = running ] && [ $((SECONDS - t0)) -gt 120 ] && runners_check
     if [ $((SECONDS - t0)) -gt 7200 ]; then
       note "still running after two hours — stopped watching; --status shows it later"; return 1
     fi
