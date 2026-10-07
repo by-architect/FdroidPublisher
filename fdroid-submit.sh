@@ -26,8 +26,9 @@ wizard_fdroid() {
 # It detects what it can from your app repo, then asks about every line of
 # metadata/<applicationId>.yml in your fdroiddata fork — starting from F-Droid's
 # file for an update, your own copy, or another app built the same way — so a
-# recipe can be shaped app by app. It validates the file with the fdroid CLI,
-# pushes a branch and — with glab logged in — opens the merge request.
+# recipe can be shaped app by app. It runs the checks fdroiddata's pipeline
+# runs, with the newest fdroidserver, then pushes a branch and — with glab
+# logged in — opens the merge request.
 #
 # Nothing leaves your machine without asking first, unless you pass --yes.
 
@@ -73,8 +74,10 @@ fdroid-submit.sh — interactive wizard for getting an Android app into F-Droid.
       --forget-task forget one task by name (as the task list shows it)
 
 Detects what it can from your app's git checkout and only asks for the rest,
-writes metadata/<applicationId>.yml into your fdroiddata fork, validates it,
-pushes a branch and — with glab logged in — opens the merge request as a
+writes metadata/<applicationId>.yml into your fdroiddata fork, runs the
+checks fdroiddata's pipeline runs (with the newest fdroidserver, downloaded
+on first use), pushes a branch and — with glab logged in — opens the merge
+request as a
 draft, watches its pipeline, and marks it ready for review once it passes.
 Each app is one task, which follows it from the first merge request to
 F-Droid and through every update after.
@@ -506,66 +509,207 @@ EOF
 }
 
 # ------------------------------------------------------------------- fdroid CLI
-# The wizard never installs fdroidserver itself. It uses the one you have:
-# `fdroid` on PATH, or a source checkout of fdroidserver (run the way
-# fdroiddata's CI runs master: PATH and PYTHONPATH pointed at the checkout).
-# If there is neither, it says how to install one and waits for you.
+# The checks run on fdroidserver's newest code — what fdroiddata's pipeline
+# runs — so they find what the pipeline would, and nothing it would not: an
+# older release trips over other apps' newer recipes and lays files out its own
+# way. It is a git checkout in a folder of your choosing (or one you have
+# already, cloned for something else), brought up to date on each run. Its
+# Python libraries come from this system or — when they are missing there —
+# from an installed fdroid, which carries them all. If it still does not run
+# here, the local checks are skipped: the merge request's pipeline runs every
+# one of them anyway.
 RUNNER=""
 FDROIDSERVER_DIR=""
+FDROID_PY=""       # a python with the checkout's libraries, for fdroiddata's tools/
+FD_SCANNER_OK=0    # its scanner loads too: APKs can be scanned, `fdroid build` can run
+FDROIDSERVER_GIT="https://gitlab.com/fdroid/fdroidserver.git"
+FDROIDSERVER_MIRROR="https://github.com/f-droid/fdroidserver.git"
+# Where it is downloaded to by default: the tools/ folder of this wizard's own
+# project, when the wizard lives in a <project>/branches/<branch> layout — the
+# tools a project uses live next to it there — else ~/Opt/fdroidserver.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+TOOLS_DIR=""
+if [ "$(basename "$(dirname "$SELF_DIR")")" = branches ]; then
+  TOOLS_DIR="$(dirname "$(dirname "$SELF_DIR")")/tools"
+fi
+FD_DEFAULT="$HOME/Opt/fdroidserver"
+[ -z "$TOOLS_DIR" ] || FD_DEFAULT="$TOOLS_DIR/fdroidserver"
 
-fdroid_checkout_runs() {  # fdroid_checkout_runs <dir>
-  PATH="$1:$PATH" PYTHONPATH="$1${PYTHONPATH:+:$PYTHONPATH}" \
-    "$1/fdroid" --version >/dev/null 2>&1
-}
-
-find_fdroid() {  # sets RUNNER; false if nothing usable was found
-  local d ver
-  make_git_shim
-  if have fdroid; then
-    ver="$(fdroid --version 2>/dev/null | tail -1)"
-    RUNNER=path; ok "fdroid ${ver:+$ver }on PATH ($(command -v fdroid))"
-    return 0
-  fi
-  for d in "${FDROIDSERVER:-}" "${SAVED_FDROIDSERVER:-}" \
+fd_is_checkout() { [ -f "$1/fdroid" ] && [ -d "$1/fdroidserver" ]; }
+fd_candidates() {  # checkouts this machine may have already, the likeliest first
+  local d
+  for d in "${FDROIDSERVER:-}" "${SAVED_FDROIDSERVER:-}" "$FD_DEFAULT" \
            "$HOME/Opt/fdroidserver" "$HOME/opt/fdroidserver" "$HOME/fdroidserver" \
-           "$HOME/src/fdroidserver" "$HOME/Projects/fdroidserver"; do
-    [ -n "$d" ] || continue
-    d="${d/#\~/$HOME}"
-    [ -f "$d/fdroid" ] || continue
-    if fdroid_checkout_runs "$d"; then
-      RUNNER=checkout; FDROIDSERVER_DIR="$d"
-      ver="$(PATH="$d:$PATH" PYTHONPATH="$d" "$d/fdroid" --version 2>/dev/null | tail -1)"
-      ok "fdroidserver checkout ${ver:+$ver }at $d"
-      return 0
-    fi
-    warn "found $d, but it doesn't run — are its Python dependencies installed?"
+           "$HOME/src/fdroidserver" "$HOME/Projects/fdroidserver" "$HOME"/Projects/*/tools/fdroidserver \
+           "$HOME"/Projects/*/fdroidserver "$HOME"/Projects/*/referanced-repo*/fdroidserver \
+           "$HOME"/Projects/*/branches/*/referanced-repo*/fdroidserver; do
+    if [ -n "$d" ]; then printf '%s\n' "${d/#\~/$HOME}"; fi
+  done
+}
+fd_git() {  # git for fdroidserver's own public repo: never a password or passphrase
+            # prompt, and https stays https even when your git config reroutes it to ssh
+  local t="" envs=(GIT_TERMINAL_PROMPT=0 "GIT_SSH_COMMAND=ssh -o BatchMode=yes")
+  have timeout && t="timeout 300"
+  [ -n "$GIT_CFG_OFF" ] && envs+=(GIT_CONFIG_GLOBAL=/dev/null)
+  # shellcheck disable=SC2086
+  env "${envs[@]}" $t git "$@"
+}
+fd_update() {  # fd_update <checkout> — fast-forward it to master, when that is safe
+  local ck="$1" br
+  git -C "$ck" rev-parse --git-dir >/dev/null 2>&1 || return 0   # not a git checkout: as it is
+  br="$(git -C "$ck" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+  case "$br" in
+    master|main) ;;
+    *) note "$ck is on ${br:-a detached commit}, not master — used as it is"; return 0 ;;
+  esac
+  if [ -n "$(git -C "$ck" status --porcelain --untracked-files=no 2>/dev/null || true)" ]; then
+    note "$ck holds changes of yours — not updated, used as it is"; return 0
+  fi
+  say "bringing fdroidserver in $ck up to date…"
+  fd_git -C "$ck" pull -q --ff-only >/dev/null 2>&1 \
+    || note "could not update it (offline?) — using it as it is"
+}
+fd_download() {  # fd_download <new folder> — a shallow clone of fdroidserver's master
+  local ck="$1" url
+  if [ -e "$ck" ] && [ -n "$(ls -A "$ck" 2>/dev/null || true)" ]; then
+    warn "$ck is not empty — choose a new folder"; return 1
+  fi
+  mkdir -p "$(dirname "$ck")" || return 1
+  say "downloading fdroidserver into $ck (about 30 MB)…"
+  for url in "$FDROIDSERVER_GIT" "$FDROIDSERVER_MIRROR"; do
+    fd_git clone -q --depth 1 "$url" "$ck" 2>/dev/null && return 0
+    rm -rf "$ck"    # it was new or empty: what is there now is the failed download
+    note "could not download it from $url"
   done
   return 1
 }
 
-detect_runner() {
+# fd_pythons — "python TAB library folders" pairs that may run the checkout:
+# this system's python3, then the interpreter of an installed fdroid with the
+# folders it adds (a Nix wrapper lists them; a pip or venv one needs none).
+fd_pythons() {
+  local w real wrapped py dirs
+  have python3 && printf '%s\t[]\n' "$(command -v python3)"
+  have fdroid || return 0
+  w="$(command -v fdroid)"; real="$(readlink -f "$w")"
+  wrapped="$(dirname "$real")/.fdroid-wrapped"
+  if [ -f "$wrapped" ]; then
+    py="$(head -1 "$wrapped" | sed 's/^#!//')"
+    # the file package's magic.py shadows python-magic, and does not even load
+    dirs="$(grep -o "\[\('/nix/store/[^']*site-packages',\?\)*\]" "$wrapped" | head -1 \
+            | sed -E "s#'/nix/store/[^']*-file-[0-9][^']*',?##g")"
+    if [ -n "$py" ]; then printf '%s\t%s\n' "$py" "${dirs:-[]}"; fi
+  else
+    py="$(head -1 "$real" | sed -n 's/^#!//p' | awk '{print $1}')"
+    case "$py" in */python*) printf '%s\t[]\n' "$py" ;; esac
+  fi
+  return 0
+}
+
+fd_make() {  # fd_make <checkout> <python> <folders> — the two launchers, then a test
+  local ck="$1" py="$2" dirs="$3"
+  cat > "$WORK/fdroid-py" <<FDPY
+#!$py
+# written by fdroid-submit.sh: python with fdroidserver's checkout first
+import runpy, site, sys
+for p in $dirs:
+    site.addsitedir(p)
+sys.path.insert(0, '$ck')
+try:
+    import magic
+except Exception:
+    # no python-magic that loads: the scanner's one call, through \`file\`
+    sys.path.insert(1, '$WORK/pyshim')
+    sys.modules.pop('magic', None)
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
+FDPY
+  # fdroidserver's scanner needs python-magic for one thing, magic.from_file —
+  # and the one Nix's fdroid carries does not even load. The file command is
+  # the same libmagic, so it stands in when there is nothing better.
+  mkdir -p "$WORK/pyshim"
+  cat > "$WORK/pyshim/magic.py" <<'FDMAGIC'
+"""magic.from_file through the file command, for fdroidserver's scanner —
+written by fdroid-submit.sh where python-magic is missing or broken"""
+import subprocess
+
+
+def from_file(path, mime=False):
+    cmd = ['file', '--brief'] + (['--mime-type'] if mime else []) + ['--', str(path)]
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+FDMAGIC
+  cat > "$WORK/fdroid-latest" <<FDBIN
+#!/bin/sh
+exec '$WORK/fdroid-py' '$ck/fdroid' "\$@"
+FDBIN
+  chmod +x "$WORK/fdroid-py" "$WORK/fdroid-latest"
+  cat > "$WORK/fd-test.py" <<'FDTEST'
+import sys
+import fdroidserver, fdroidserver.common, fdroidserver.metadata, fdroidserver.lint
+import fdroidserver.rewritemeta, fdroidserver.checkupdates, yaml, ruamel.yaml
+if not fdroidserver.__file__.startswith(sys.argv[1]):
+    sys.exit('an installed fdroidserver came first: ' + fdroidserver.__file__)
+try:
+    import fdroidserver.scanner
+    print('scanner')
+except Exception:
+    pass
+FDTEST
+  "$WORK/fdroid-py" "$WORK/fd-test.py" "$ck" > "$WORK/fd-test.out" 2>&1
+}
+
+find_fdroid() {  # sets RUNNER=latest when the newest fdroidserver runs here
+  local d ck="" py dirs
   make_git_shim
-  find_fdroid && return 0
-  warn "fdroidserver is not installed (or not in the places this wizard looks)"
-  say "It validates the metadata before you open the merge request. Install it"
-  say "yourself, whichever way suits you — for example:"
-  note "  nix:            nix profile install nixpkgs#fdroidserver   (or add it to your config)"
-  note "  Debian/Ubuntu:  sudo apt install fdroidserver"
-  note "  like F-Droid CI: git clone https://gitlab.com/fdroid/fdroidserver.git ~/Opt/fdroidserver"
-  note "                  (runs from the checkout; its Python dependencies must be installed)"
-  while :; do
-    say "r) check again   p) give the path to a checkout   s) skip validation   q) quit"
-    ask FDCHOICE "Choice" "r"
-    case "$FDCHOICE" in
-      r|R) find_fdroid && return 0; warn "still not found" ;;
-      p|P) ask FDROIDSERVER "Path to the fdroidserver checkout" "$HOME/Opt/fdroidserver"
-           find_fdroid && return 0 ;;
-      s|S) RUNNER=none; warn "validation will be skipped — the maintainers' CI will still run it"
-           return 0 ;;
-      q|Q) exit 0 ;;
-      *)   warn "r, p, s or q" ;;
+  while IFS= read -r d; do
+    if fd_is_checkout "$d"; then ck="$d"; break; fi
+  done < <(fd_candidates)
+  if [ -n "$ck" ]; then
+    fd_update "$ck"
+  fi
+  while [ -z "$ck" ]; do
+    printf '\n'
+    say "The checks in stage 4 run on fdroidserver's newest code — the code fdroiddata's"
+    say "pipeline runs — so they find what the pipeline would. It is not on this machine."
+    say "  1) download it (about 30 MB), into a folder you choose"
+    say "  2) use a copy you have already — give its folder"
+    say "  3) skip the local checks — the merge request's pipeline runs them all"
+    ask FD_SETUP "Which" "1"
+    case "$FD_SETUP" in
+      1) ask FDROIDSERVER "Download it into" "$FD_DEFAULT"
+         d="${FDROIDSERVER/#\~/$HOME}"; case "$d" in /*) ;; *) d="$PWD/$d" ;; esac
+         if fd_is_checkout "$d"; then ck="$d"; fd_update "$ck"
+         elif fd_download "$d"; then ck="$d"
+         else warn "the download did not work"; fi ;;
+      2) ask FDROIDSERVER "Folder of your fdroidserver copy" ""
+         d="${FDROIDSERVER/#\~/$HOME}"; case "$d" in /*) ;; *) d="$PWD/$d" ;; esac
+         if fd_is_checkout "$d"; then ck="$d"; fd_update "$ck"
+         else warn "$d does not hold fdroidserver (an fdroid script and an fdroidserver/ folder)"; fi ;;
+      3) note "local checks skipped — the merge request's pipeline runs them"; return 1 ;;
+      *) warn "1, 2 or 3" ;;
     esac
+    if [ -z "$ck" ] && [ "$ASSUME_YES" = 1 ]; then return 1; fi
   done
+  while IFS=$'\t' read -r py dirs; do
+    [ -n "$py" ] || continue
+    if fd_make "$ck" "$py" "$dirs"; then
+      RUNNER=latest; FDROIDSERVER_DIR="$ck"; FDROID_PY="$WORK/fdroid-py"
+      if grep -qx 'scanner' "$WORK/fd-test.out" && have file; then FD_SCANNER_OK=1; fi
+      ok "fdroidserver $(git -C "$ck" log -1 --format='%h, %cs' 2>/dev/null || echo '(newest)'), at $ck"
+      save_answers
+      return 0
+    fi
+  done < <(fd_pythons)
+  warn "the newest fdroidserver does not run on this machine — Python libraries it needs are missing:"
+  tail -n 2 "$WORK/fd-test.out" | sed 's/^/       /'
+  note "local checks skipped — the merge request's pipeline runs them all"
+  return 1
+}
+
+detect_runner() {
+  find_fdroid && return 0
+  RUNNER=none
+  return 0
 }
 
 # Two things about this machine can stop fdroidserver's git calls dead, and
@@ -629,6 +773,7 @@ while [ "\$n" -gt 0 ]; do
   a=\$1; shift
   case "\$a" in
     core.askpass=/bin/true)     a='core.askpass=$t' ;;
+    credential.helper=/bin/true) a='credential.helper=$t' ;;
     core.sshCommand=/bin/false) a='core.sshCommand=$f' ;;
   esac
   set -- "\$@" "\$a"
@@ -645,25 +790,27 @@ SHIM
   fi
 }
 
-frun() {  # frun <fdroid args...>   — run inside $FDROIDDATA
-  # The shim below goes on PATH, but PATH alone is not enough: a packaged
-  # fdroid (nix, pipx) is a wrapper script that prepends its own store paths,
-  # so the real git wins and the shim is never called. Pass the same fixes as
-  # environment variables too, which no wrapper reorders. fdroidserver sets
-  # GIT_ASKPASS and GIT_SSH itself, but not GIT_SSH_COMMAND (which outranks
-  # GIT_SSH) and not GIT_CONFIG_GLOBAL, so these two still land.
+# fd_in <command…> — run it inside $FDROIDDATA, with the git fixes above. The
+# shim goes on PATH, but PATH alone is not enough: a packaged fdroid (nix,
+# pipx) is a wrapper that prepends its own store paths, so the real git wins
+# and the shim is never called. The same fixes go in as environment variables
+# too, which no wrapper reorders. fdroidserver sets GIT_ASKPASS and GIT_SSH
+# itself, but not GIT_SSH_COMMAND (which outranks GIT_SSH) and not
+# GIT_CONFIG_GLOBAL, so these two still land.
+fd_in() {
   local envs=()
   [ -n "$GIT_CFG_OFF" ] && envs+=("GIT_CONFIG_GLOBAL=/dev/null")
   [ -n "$GIT_REAL_FALSE" ] && envs+=("GIT_SSH_COMMAND=$GIT_REAL_FALSE")
-  case "$RUNNER" in
-    path)     ( cd "$FDROIDDATA" && PATH="${GIT_SHIM:+$GIT_SHIM:}$PATH" \
-                env "${envs[@]+"${envs[@]}"}" fdroid "$@" ) ;;
-    checkout) ( cd "$FDROIDDATA" && \
-                PATH="${GIT_SHIM:+$GIT_SHIM:}$FDROIDSERVER_DIR:$PATH" \
-                PYTHONPATH="$FDROIDSERVER_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-                env "${envs[@]+"${envs[@]}"}" "$FDROIDSERVER_DIR/fdroid" "$@" ) ;;
-    none)     warn "skipped: fdroid $*"; return 0 ;;
-  esac
+  ( cd "$FDROIDDATA" && PATH="${GIT_SHIM:+$GIT_SHIM:}$PATH" \
+    env "${envs[@]+"${envs[@]}"}" "$@" )
+}
+frun() {  # frun <fdroid args…> — the newest fdroid, inside $FDROIDDATA
+  if [ "$RUNNER" != latest ]; then warn "skipped: fdroid $*"; return 0; fi
+  fd_in "$WORK/fdroid-latest" "$@"
+}
+fpy() {  # fpy <script> [args…] — one of fdroiddata's tools/, with fdroidserver's libraries
+  [ -n "$FDROID_PY" ] || return 1
+  fd_in "$FDROID_PY" "$@"
 }
 
 # ------------------------------------------------------- GitLab, and the fork
@@ -1377,7 +1524,7 @@ cat <<BANNER
     1. your app repo      — what F-Droid needs to know, plus the usual pitfalls
     2. fdroiddata fork    — clone it, branch off current upstream master
     3. metadata           — write (or extend) metadata/<appid>.yml
-    4. validate           — fdroid readmeta / rewritemeta / lint / build
+    4. checks             — what fdroiddata's pipeline checks, run here first
     5. push               — branch pushed, merge request opened
 
 BANNER
@@ -1998,6 +2145,36 @@ esac
 [ -n "$WEB_GUESS" ] || warn "no usable 'origin' remote — you will have to type the URLs"
 
 # ----------------------------------------------------- 1b. common MR blockers
+# Every check this run makes — the pitfalls below, then in stage 4 the ones
+# fdroiddata's pipeline runs — and how it went, for the summary before the push.
+#   passed[: note]   warn: what to look at   failed: why   skipped: why
+declare -A CHK=()
+CHK_NAMES=()
+chk() {  # chk <check> <outcome>
+  [ -v "CHK[$1]" ] || CHK_NAMES+=("$1")
+  CHK["$1"]="$2"
+}
+chk_with() {  # chk_with <outcome prefix> — the checks whose outcome starts so, comma separated
+  local k out=""
+  for k in ${CHK_NAMES[@]+"${CHK_NAMES[@]}"}; do
+    case "${CHK[$k]}" in "$1"*) out="${out:+$out, }$k" ;; esac
+  done
+  printf '%s' "$out"
+}
+chk_summary() {
+  local k v
+  for k in ${CHK_NAMES[@]+"${CHK_NAMES[@]}"}; do
+    v="${CHK[$k]}"
+    case "$v" in
+      passed)   ok "$k" ;;
+      passed:*) ok "$k — ${v#passed: }" ;;
+      warn:*)   warn "$k — ${v#warn: }" ;;
+      failed:*) printf '   %s✗ %s — %s%s\n' "$RED" "$k" "${v#failed: }" "$R" ;;
+      *)        note "– $k — ${v#skipped: }" ;;
+    esac
+  done
+}
+
 step "Pitfall check"
 BLOCKERS=0
 
@@ -2069,6 +2246,30 @@ if ! git -C "$REPO" grep -qE 'includeInApk[[:space:]]*=?[[:space:]]*false' -- '*
   note "  android { dependenciesInfo { includeInApk = false; includeInBundle = false } }"
 fi
 
+# fdroiddata's build job fails an app whose gradle files fetch from a plain
+# http:// repository (its tools/audit-gradle.py): anyone on the way could hand
+# the build a different library.
+mapfile -t GRADLE_FILES < <(git -C "$REPO" ls-files -- '*.gradle' '*.gradle.kts' 2>/dev/null || true)
+HTTP_REPOS="$(python3 - "$REPO" ${GRADLE_FILES[@]+"${GRADLE_FILES[@]}"} <<'PYHTTP' 2>/dev/null || true
+import re, sys
+root = sys.argv[1]
+pat = re.compile(r'repositories\s*\{[^}]*?(http://[^\s"\')]+)', re.S)
+for f in sys.argv[2:]:
+    try:
+        data = open(root + '/' + f, encoding='utf-8', errors='replace').read()
+    except OSError:
+        continue
+    for m in pat.finditer(data):
+        print('%s: %s' % (f, m.group(1)))
+PYHTTP
+)"
+if [ -n "$HTTP_REPOS" ]; then
+  warn "gradle fetches libraries over plain http:// — fdroiddata's build job fails on it:"
+  printf '%s\n' "$HTTP_REPOS" | head -5 | sed 's/^/       /'
+  note "switch them to https://, then commit and tag again"
+  BLOCKERS=$((BLOCKERS+1))
+fi
+
 if [ -n "$FLUTTER_DIR" ]; then
   PUBSPEC="$REPO/$FLUTTER_DIR/pubspec.yaml"
   # Plugins that pull in Google Play services / Firebase / ads.
@@ -2134,6 +2335,87 @@ else
   note "alongside icon.png and featureGraphic.png; commit them under the build tag"
 fi
 
+# What fdroiddata's "check source code" job reports to the reviewers about the
+# listing, read from the tag F-Droid builds: en-US needs a summary and a
+# description, every text has a length limit, and locale folders need names
+# F-Droid knows.
+fastlane_report() {  # fastlane_report <ref> <…/fastlane/metadata/android> — "level TAB message" lines
+  python3 - "$REPO" "$1" "$2" "$VCODE" "$((10 * VCODE + 1))" "$((10 * VCODE + 2))" "$((10 * VCODE + 3))" <<'PYFL'
+import re, subprocess, sys
+repo, ref, base = sys.argv[1:4]
+codes = sys.argv[4:]
+LIMITS = {'title.txt': 50, 'short_description.txt': 80, 'full_description.txt': 4000, 'video.txt': 256}
+LOCALE = re.compile(r'[a-z]{2,3}(-([A-Z][a-zA-Z]+|\d+|[a-z]+))*')
+MARKDOWN = re.compile(r'(^#{1,6}\s|\*\*[^*\n]+\*\*|__[^_\n]+__|\[[^\]\n]+\]\([^)\n]+\)|`[^`\n]+`)', re.M)
+
+
+def git(*a):
+    return subprocess.run(['git', '-C', repo] + list(a), capture_output=True).stdout.decode('utf-8', 'replace')
+
+
+def text(loc, f):
+    return git('show', '%s:%s/%s/%s' % (ref, base, loc, f)).strip()
+
+
+locales = {}
+for n in git('ls-tree', '-r', '--name-only', ref, '--', base + '/').split('\n'):
+    parts = n[len(base) + 1:].split('/') if n else []
+    if len(parts) >= 2:
+        locales.setdefault(parts[0], []).append('/'.join(parts[1:]))
+en = locales.get('en-US', [])
+for f, what in (('short_description.txt', 'summary'), ('full_description.txt', 'description')):
+    if f not in en or not text('en-US', f):
+        print('crit\ten-US has no %s — F-Droid shows no %s without it' % (f, what))
+for loc in sorted(locales):
+    if not LOCALE.fullmatch(loc):
+        fix = next((loc.replace(a, b) for a, b in (('_', '-'), ('-r', '-'), ('_r', '-'))
+                    if LOCALE.fullmatch(loc.replace(a, b))), '')
+        print('warn\t%s is not a locale name F-Droid takes%s' % (loc, ' — %s?' % fix if fix else ''))
+    for f in locales[loc]:
+        limit = LIMITS.get(f)
+        if f.startswith('changelogs/') and f[len('changelogs/'):-len('.txt')] in codes:
+            limit = 500
+        if limit:
+            n = len(text(loc, f))
+            if n > limit:
+                print('warn\t%s/%s is %d characters — F-Droid cuts it at %d' % (loc, f, n, limit))
+    if 'full_description.txt' in locales[loc] and MARKDOWN.search(text(loc, 'full_description.txt')):
+        print('note\t%s/full_description.txt looks like Markdown — F-Droid shows it as text (simple HTML works)' % loc)
+PYFL
+}
+FL_REF="$TAG"
+git -C "$REPO" rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1 || FL_REF=HEAD
+FL_DIR=""
+for d in fastlane/metadata/android ${FLUTTER_DIR:+"$FLUTTER_DIR/fastlane/metadata/android"}; do
+  [ "${d#./}" = "$d" ] || continue
+  if [ -n "$(git -C "$REPO" ls-tree --name-only "$FL_REF" -- "$d/" 2>/dev/null || true)" ]; then FL_DIR="$d"; break; fi
+done
+if [ -n "$FL_DIR" ]; then
+  FL_CRIT=0; FL_WARN=0
+  while IFS=$'\t' read -r lvl msg; do
+    case "$lvl" in
+      crit) warn "$msg"; FL_CRIT=$((FL_CRIT + 1)) ;;
+      warn) warn "$msg"; FL_WARN=$((FL_WARN + 1)) ;;
+      note) note "$msg" ;;
+    esac
+  done < <(fastlane_report "$FL_REF" "$FL_DIR" 2>/dev/null || true)
+  if [ "$FL_CRIT" -gt 0 ]; then
+    chk "check source code (the listing)" "failed: $FL_CRIT thing(s) missing from $FL_DIR at $FL_REF"
+    BLOCKERS=$((BLOCKERS+1))
+  elif [ "$FL_WARN" -gt 0 ]; then
+    chk "check source code (the listing)" "warn: $FL_WARN thing(s) to look at in $FL_DIR"
+  else
+    ok "the listing in $FL_DIR has what F-Droid needs"
+    chk "check source code (the listing)" "passed: $FL_DIR at $FL_REF"
+  fi
+elif [ -d "$REPO/$SUBDIR/src/main/play" ]; then
+  chk "check source code (the listing)" "skipped: a Triple-T listing — the pipeline reads it itself"
+else
+  chk "check source code (the listing)" "failed: no fastlane listing in $FL_REF"
+fi
+
+if [ "$BLOCKERS" = 0 ]; then chk "pitfall check (your app repo)" passed
+else chk "pitfall check (your app repo)" "warn: $BLOCKERS thing(s) reviewers usually ask about, listed under Pitfall check"; fi
 [ "$BLOCKERS" = 0 ] || { echo; confirm "Carry on despite the above?" y || exit 1; }
 
 # ========================================================== 2. fdroiddata fork
@@ -2645,7 +2927,14 @@ def cmd_template(gdir, ddir, kind, out, vcode):
 
     def from_base(e, g, keep=()):
         new = dict(e)
+        # the version your unmerged recipe already builds: keep the commit it
+        # builds — a fix made after the tag (the listing, say) stays in
+        same = (kind in ('fork', 'app') and os.environ.get('FDS_KEEP_COMMIT') == '1'
+                and all(e.get(k, ('s', ''))[1] == g.get(k, ('s', ''))[1]
+                        for k in ('versionName', 'versionCode')))
         for k in version + tuple(keep):
+            if k == 'commit' and same and 'commit' in e:
+                continue
             if k in g:
                 new[k] = g[k]
             else:
@@ -3033,21 +3322,21 @@ fdef top Bitcoin s "a Bitcoin address for donations"
 fdef top Litecoin s "a Litecoin address for donations"
 fdef top Name s "the name F-Droid shows, when it should differ from the app's own"
 fdef top AutoName s "the app's android:label — CI fills it in when it is missing"
-fdef top Summary s "one line about the app — normally read from fastlane in your repo"
-fdef top Description b "the long description — normally read from fastlane in your repo"
+fdef top Summary s "avoid it: the pipeline fails on it — F-Droid reads fastlane's short_description.txt"
+fdef top Description b "avoid it: F-Droid reads fastlane's full_description.txt from your repo"
 fdef top RequiresRoot s "true if the app needs root on the phone"
 fdef top RepoType s "git, almost always"
 fdef top Repo s "the address F-Droid clones the source from"
-fdef top Binaries s "where your signed APKs are, for reproducible builds (%v is the version)"
-fdef top AllowedAPKSigningKeys l "the SHA-256 of your signing certificate, for reproducible builds"
+fdef top Binaries s "the address of your signed APK on a release page, for reproducible builds (%v: the version)"
+fdef top AllowedAPKSigningKeys l "the SHA-256 fingerprint of the key you sign releases with"
 fdef top MaintainerNotes b "notes for F-Droid's maintainers: why the recipe is the way it is"
 fdef top ArchivePolicy s "how many old versions stay available (a number)"
 fdef top AutoUpdateMode s "Version: F-Droid adds new versions by itself · None: you send a merge request"
 fdef top UpdateCheckMode s "how new versions are found: Tags, Tags <regex>, RepoManifest, HTTP, Static or None"
 fdef top UpdateCheckIgnore s "a regex of versions the update check skips"
-fdef top VercodeOperation l "formulas from the app's versionCode to each build's, e.g. 10 * %c + 1"
+fdef top VercodeOperation l "one APK per CPU type: each one's versionCode from the app's, e.g. 10 * %c + 1"
 fdef top UpdateCheckName s "the application id the update check looks for, when the source has several"
-fdef top UpdateCheckData s "where the update check reads versions: file|code regex|file|name regex"
+fdef top UpdateCheckData s "where the update check reads version numbers, when build.gradle does not hold them"
 fdef top CurrentVersion s "the newest version F-Droid offers"
 fdef top CurrentVersionCode s "its versionCode"
 fdef top NoSourceSince s "the version since which the source is gone"
@@ -3138,6 +3427,11 @@ yhint() {  # yhint <scope> <name> <value>
       [ -n "${FLAVOURS// /}" ] && note "product flavours in ${GRADLE_FILE#"$REPO"/}: $FLAVOURS" ;;
     ndk)
       [ -n "$NATIVE" ] && note "native code: $NATIVE" ;;
+    commit)
+      if [ -n "$v" ] && [ -n "${COMMIT:-}" ] && [ "$v" != "$COMMIT" ] && [ "$v" != "$TAG" ]; then
+        note "that is not your tag $TAG (${COMMIT:0:12}) but $(git -C "$REPO" log -1 --format='%h — %s' "$v" 2>/dev/null || printf '%s' "$v")"
+        note "Enter keeps it; to build the tag instead, give the tag's hash: $COMMIT"
+      fi ;;
     UpdateCheckMode)
       if [ "${MANIFESTS:-0}" -gt 20 ]; then
         note "$MANIFESTS AndroidManifest.xml files in the repo: with Tags, checkupdates reads them all"
@@ -3307,25 +3601,54 @@ ycopy_build() {  # ycopy_build <name> — entry 1's answer for this line, in eve
   return 0
 }
 
-# The fields the recipe does not have yet, any of them a number away.
+# How often a field is wanted, for the add menus: 1 often, 2 sometimes, and
+# everything else rarely — old build systems, lines asked about elsewhere, and
+# what reviewers ask to avoid.
+declare -A FTIER=()
+for k in MaintainerNotes Name WebSite Translation Donate Liberapay OpenCollective Bitcoin Litecoin \
+         AuthorEmail AuthorWebSite IssueTracker Changelog; do FTIER["top:$k"]=1; done
+for k in ArchivePolicy UpdateCheckIgnore UpdateCheckName UpdateCheckData VercodeOperation \
+         AntiFeatures AutoName RequiresRoot; do FTIER["top:$k"]=2; done
+for k in gradle subdir submodules prebuild build rm srclibs sudo init ndk output scandelete \
+         gradleprops; do FTIER["build:$k"]=1; done
+for k in preassemble patch timeout postbuild binary antifeatures; do FTIER["build:$k"]=2; done
+
+# The fields the recipe does not have yet, each with what it is for — the ones
+# most often wanted first — any of them a number away.
 yadd() {  # yadd top|build <label>
-  local scope="$1" label="$2" names=() k i ch pre="top/" list
+  local scope="$1" label="$2" names=() k i ch pre="top/" list t tier
   [ "$ASSUME_YES" = 1 ] && return 0
   [ "$scope" = build ] && pre="b/1/"
   while :; do
     names=()
     list="$FTOP"; [ "$scope" = build ] && list="$FBUILD"
-    for k in $list; do
-      [ -f "$RR/$pre$k" ] && continue
-      case "$scope:$k" in top:Builds|build:versionName|build:versionCode) continue ;; esac
-      names+=("$k")
+    for t in 1 2 3; do
+      for k in $list; do
+        [ -f "$RR/$pre$k" ] && continue
+        case "$scope:$k" in top:Builds|build:versionName|build:versionCode) continue ;; esac
+        if [ "${FTIER[$scope:$k]:-3}" = "$t" ]; then names+=("$k"); fi
+      done
     done
-    printf '\n'; say "$label — a number or a field name, Enter when done:"
-    i=1
-    for k in "${names[@]}"; do
-      printf '   %3d) %-22s' "$i" "$k"; [ $((i % 3)) = 0 ] && printf '\n'; i=$((i + 1))
+    printf '\n'; say "${B}$label${R} — a number or a field name; Enter when done"
+    if [ "$scope" = build ]; then
+      note "anything else the build needs — most builds need nothing more"
+    else
+      note "anything else the recipe should hold — most apps need nothing more"
+    fi
+    i=1; tier=0
+    for k in ${names[@]+"${names[@]}"}; do
+      t="${FTIER[$scope:$k]:-3}"
+      if [ "$t" != "$tier" ]; then
+        tier="$t"
+        case "$t" in
+          1) say "  often added:" ;;
+          2) say "  sometimes needed:" ;;
+          *) say "  rarely needed — old build systems, or what reviewers ask to avoid:" ;;
+        esac
+      fi
+      printf '   %3d) %-18s %s%s%s\n' "$i" "$k" "$DIM" "${FHELP[$scope:$k]:-}" "$R"
+      i=$((i + 1))
     done
-    [ $(((i - 1) % 3)) = 0 ] || printf '\n'
     printf '   %sAdd%s: ' "$B" "$R" >&2; readline ch; ch="$(trim "$ch")"
     [ -n "$ch" ] || break
     case "$ch" in
@@ -3411,6 +3734,7 @@ if [ -n "$FLUTTER_DIR" ]; then
     # commit it was built from is a ref F-Droid can check out.
     case "$FL_GUESS" in *-*) [ -n "${FL_REV:-}" ] && FL_GUESS="$FL_REV" ;; esac
   fi
+  [ -n "$FL_GUESS" ] || note "the Flutter release F-Droid builds with — the one you build and test with (flutter --version)"
   auto FLUTTERREF "Flutter version" "$FL_GUESS"
   if ! printf '%s' "$FLUTTERREF" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
     warn "'$FLUTTERREF' is not a stable Flutter release"
@@ -3429,7 +3753,14 @@ if [ -n "$FLUTTER_DIR" ]; then
   # whatever the app already has in F-Droid.
   ABISPLIT=1
   if [ "$IS_UPDATE" = 0 ]; then
-    if ! confirm "Build one APK per CPU type (smaller downloads; F-Droid asks for it)?" y; then
+    say "A Flutter APK carries the app's engine once for every CPU type phones use —"
+    say "armeabi-v7a (older phones), arm64-v8a (most phones), x86_64 (emulators,"
+    say "Chromebooks) — so one APK for all of them is big. F-Droid's reviewers ask"
+    say "Flutter apps for one APK per CPU type instead: each phone downloads only its"
+    say "own. The recipe then has three build entries, numbered 10 × versionCode + 1,"
+    say "2 and 3; and if you publish your own signed APKs, this wizard can build all"
+    say "three for you."
+    if ! confirm "Build one APK per CPU type?" y; then
       ABISPLIT=0
       warn "one APK for every CPU type: F-Droid's reviewers ask Flutter apps to split it — expect that request"
     fi
@@ -3623,7 +3954,9 @@ if [ "$BASE_KIND" = reference ]; then
 fi
 
 # The new build entries: this run's versions, on top of the base's build steps.
-rcp template "$RG" "$RD" "$BASE_KIND" "$RT" "$VCODE"
+# a tag moved in this run is a new build: the recipe's own commit goes with it
+FDS_KEEP_COMMIT=1; [ "$TAG_MOVED" = 1 ] && FDS_KEEP_COMMIT=0
+FDS_KEEP_COMMIT="$FDS_KEEP_COMMIT" rcp template "$RG" "$RD" "$BASE_KIND" "$RT" "$VCODE"
 K="$(cat "$RT/b.count")"
 if [ "$IS_UPDATE" = 1 ]; then
   for n in $(seq 1 "$K"); do
@@ -3844,17 +4177,391 @@ ask_about_app() {
 }
 
 # --- who signs what users install
+# With a reproducible build F-Droid builds the app, checks the result is the
+# APK you signed, and ships yours. So it needs your APK on the release page —
+# Binaries: — and the fingerprint of your key — AllowedAPKSigningKeys:. Both
+# are worked out from what is there where they can be: the release's own
+# files, an APK built right here, the keystore your build already uses.
+
+# pick <var> <default> <choice>… — a numbered menu; <var> gets the number. A
+# choice can carry a second line (after a newline), shown dimmed below it.
+pick() {
+  local __var="$1" __def="$2" __i=1 __c __n
+  shift 2
+  __n=$#
+  for __c in "$@"; do
+    printf '     %d) %s\n' "$__i" "${__c%%$'\n'*}"
+    case "$__c" in *$'\n'*) printf '        %s%s%s\n' "$DIM" "${__c#*$'\n'}" "$R" ;; esac
+    __i=$((__i + 1))
+  done
+  while :; do
+    ask "$__var" "Which" "$__def"
+    case "${!__var}" in
+      ''|*[!0-9]*) ;;
+      *) if [ "${!__var}" -ge 1 ] && [ "${!__var}" -le "$__n" ]; then return 0; fi ;;
+    esac
+    [ "$ASSUME_YES" = 1 ] && die "--yes: '${!__var}' is not one of the choices — run once without --yes"
+    warn "a number from 1 to $__n"
+  done
+}
+
+tag_pattern() {  # the tag with the version as %v: v1.2.3 -> v%v
+  case "$TAG" in
+    *"$VNAME"*) printf '%s' "${TAG//"$VNAME"/%v}" ;;
+    *) printf '%s' "$TAG" ;;
+  esac
+}
+apk_abi() {  # apk_abi <file name> — the CPU type it is for, if it says
+  printf '%s' "$1" | grep -oE 'armeabi-v7a|arm64-v8a|x86_64|x86' | sed -n 1p || true
+}
+apk_pattern() {  # apk_pattern <file name> — with %v, %c and %abi where they go
+  local s="$1" a
+  a="$(apk_abi "$s")"
+  [ -z "$a" ] || s="${s//"$a"/%abi}"
+  s="${s//"$VNAME"/%v}"
+  printf '%s' "$s" | sed -E "s/(^|[^0-9])$VCODE([^0-9]|\$)/\\1%c\\2/g"
+}
+release_assets() {  # release_assets <tag> — the files on the forge's release for it
+  local path json=""
+  case "$WEB_GUESS" in
+    https://github.com/*)
+      path="${WEB_GUESS#https://github.com/}"
+      if [ "$FORGE_CLI" = gh ]; then
+        json="$(cd "$REPO" && gh api "repos/$path/releases/tags/$1" 2>/dev/null || true)"
+      else
+        json="$(curl -s --max-time 20 "https://api.github.com/repos/$path/releases/tags/$1" 2>/dev/null || true)"
+      fi ;;
+    https://codeberg.org/*)
+      path="${WEB_GUESS#https://codeberg.org/}"
+      json="$(curl -s --max-time 20 "https://codeberg.org/api/v1/repos/$path/releases/tags/$1" 2>/dev/null || true)" ;;
+    *) return 0 ;;
+  esac
+  printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit()
+for a in (d.get("assets") or []) if isinstance(d, dict) else []:
+    print(a.get("name") or "")
+' 2>/dev/null || true
+}
+binary_there() {  # binary_there <url> — say whether the APK can be downloaded
+  local code
+  code="$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 20 "$1" 2>/dev/null || true)"
+  case "$code" in
+    200) ok "found the APK: $1" ;;
+    404) warn "no APK at $1"
+         note "upload the signed APK to the release, or fix the address — F-Droid needs to download it" ;;
+    *)   note "could not check $1 (HTTP ${code:-none})" ;;
+  esac
+  return 0
+}
+
+# What an APK says about itself.
+apk_cert() {  # apk_cert <apk> — its signing certificate's SHA-256, as F-Droid writes it
+  local as="" cand out=""
+  if have apksigner; then as="apksigner"
+  elif [ -n "${ANDROID_HOME:-}" ]; then
+    cand="$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)"
+    if [ -n "$cand" ] && [ -f "$cand/lib/apksigner.jar" ]; then as="java -jar $cand/lib/apksigner.jar"; fi
+  fi
+  if [ -n "$as" ]; then
+    # shellcheck disable=SC2086
+    out="$($as verify --print-certs "$1" 2>/dev/null | awk '/certificate SHA-256 digest/ {print $NF; exit}' || true)"
+  fi
+  # keytool ships with any JDK and reads the APK's signature block too
+  if [ -z "$out" ] && have keytool; then
+    out="$(keytool -printcert -jarfile "$1" 2>/dev/null | awk '/SHA256:/ {print $2; exit}' || true)"
+  fi
+  printf '%s' "$out" | tr -d ': ' | tr 'A-F' 'a-f'
+}
+apk_is_debug() {  # true when the APK is signed with Android's debug key
+  { apksigner verify --print-certs "$1" 2>/dev/null || keytool -printcert -jarfile "$1" 2>/dev/null || true; } \
+    | grep -q 'CN=Android Debug'
+}
+apk_vcode() {  # apk_vcode <apk> — its versionCode, when aapt2 is at hand
+  local a
+  a="$(command -v aapt2 2>/dev/null || ls -d "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/nonexistent}}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1 || true)"
+  [ -n "$a" ] || return 0
+  "$a" dump badging "$1" 2>/dev/null | sed -nE "s/.*versionCode='([0-9]+)'.*/\1/p" | sed -n 1p || true
+}
+sigclean() { printf '%s' "$1" | tr -d ': ' | tr 'A-F' 'a-f'; }
+sigok() { printf '%s' "$1" | grep -qE '^[0-9a-f]{64}$'; }
+
+check_reference_apk() {  # check_reference_apk <apk> [built] — what F-Droid's checks will say about it
+  local blk
+  [ -f "$1" ] || return 0
+  reference_apk_blocks "$1" | while IFS= read -r blk; do
+    [ -n "$blk" ] || continue
+    warn "the APK carries an extra signing block: $blk"
+    note "F-Droid's scanner refuses it — the \"check apk\" job fails once"
+    note "everything else has passed. Switch it off in the gradle file:"
+    note "  android { dependenciesInfo { includeInApk = false; includeInBundle = false } }"
+    note "that changes the APK, so it needs a new version and new binaries"
+  done
+  reference_apk_reproducible "$1" "$APPID" && return 0
+  # built here just now, at your request: say what the recipe needs, and go on
+  if [ "${2-}" = built ]; then
+    note "add those lines when the build entry is asked about, below"
+    return 0
+  fi
+  confirm "Submit with reproducible builds anyway?" n || \
+    die "build the APK you publish at F-Droid's path first, then re-run"
+}
+
+# --- build the release APKs here: signed with your key the way your project
+# signs releases, and one per CPU type when the recipe has one build entry per
+# CPU type. BUILT_APKS lists what came out; BUILT_SHA is their key.
+BUILT_APKS=""; BUILT_SHA=""
+can_build_here() {  # flutter for a Flutter app, the project's gradle wrapper otherwise
+  if [ -n "$FLUTTER_DIR" ]; then have flutter; else [ -x "$REPO/gradlew" ]; fi
+}
+build_release_apks() {
+  local flags task mod fl fv log="$WORK/apk-build.log" out f s vc want n abi keep fdir="$REPO"
+  BUILT_APKS=""; BUILT_SHA=""
+  [ "${FLUTTER_DIR:-.}" = . ] || fdir="$REPO/$FLUTTER_DIR"
+  if [ "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)" != "$COMMIT" ]; then
+    warn "your checkout is not at $TAG — F-Droid builds $TAG, so the APK has to come from it"
+    note "check it out first (git -C $REPO checkout $TAG), or build it yourself"
+    return 1
+  fi
+  if [ -n "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null || true)" ]; then
+    warn "you have uncommitted changes: they would go into this APK, but not into F-Droid's"
+    confirm "Build anyway?" n || return 1
+  fi
+  : > "$WORK/build.stamp"
+  if [ -n "$FLUTTER_DIR" ]; then
+    fv="$(flutter --version --machine 2>/dev/null \
+          | sed -nE 's/.*"frameworkVersion"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | sed -n 1p || true)"
+    if [ -n "$fv" ] && [ -n "${FLUTTERREF:-}" ] && [ "$fv" != "$FLUTTERREF" ]; then
+      warn "your flutter is $fv; the recipe builds with $FLUTTERREF — the APKs would not match F-Droid's"
+      confirm "Build with $fv anyway?" n || return 1
+    fi
+    flags="--release"
+    [ "$K" -gt 1 ] && flags="$flags --split-per-abi"
+    [ -n "${GRADLEFLAVOUR:-}" ] && flags="$flags --flavor $GRADLEFLAVOUR"
+    if [ "$fdir" = "$REPO" ]; then say "flutter build apk $flags — a few minutes, quiet until it ends"
+    else say "flutter build apk $flags — in $FLUTTER_DIR/; a few minutes, quiet until it ends"; fi
+    note "its output goes to $log"
+    # shellcheck disable=SC2086
+    if ! ( cd "$fdir" && flutter pub get && flutter build apk $flags ) > "$log" 2>&1; then
+      warn "the build failed:"; tail -n 15 "$log" | sed 's/^/       /'; KEEP_WORK=1; return 1
+    fi
+    out="$fdir/build/app/outputs/flutter-apk"
+  else
+    mod=":${SUBDIR//\//:}"; [ "$SUBDIR" = . ] && mod=""
+    fl=""
+    case "${GRADLE_DEF:-yes}" in
+      yes) ;;
+      *) fl="$(printf '%s' "${GRADLE_DEF:0:1}" | tr '[:lower:]' '[:upper:]')${GRADLE_DEF:1}" ;;
+    esac
+    task="$mod:assemble${fl}Release"
+    say "./gradlew $task — a few minutes, quiet until it ends"
+    note "its output goes to $log"
+    if ! ( cd "$REPO" && ./gradlew --console=plain "$task" ) > "$log" 2>&1; then
+      warn "the build failed:"; tail -n 15 "$log" | sed 's/^/       /'; KEEP_WORK=1; return 1
+    fi
+    out="$REPO/$SUBDIR/build/outputs/apk"; [ "$SUBDIR" != . ] || out="$REPO/build/outputs/apk"
+  fi
+  BUILT_APKS="$(find "$out" -name '*.apk' -newer "$WORK/build.stamp" 2>/dev/null | sort || true)"
+  # as many as the recipe has build entries: one per CPU type, or one for all
+  if [ "$K" -gt 1 ]; then
+    keep="$(printf '%s\n' "$BUILT_APKS" | grep -E 'armeabi-v7a|arm64-v8a|x86_64' || true)"
+  else
+    keep="$(printf '%s\n' "$BUILT_APKS" | grep -vE 'armeabi-v7a|arm64-v8a|x86_64|x86' | sed -n 1p || true)"
+  fi
+  BUILT_APKS="$keep"
+  [ -n "$BUILT_APKS" ] || { warn "the build left no fitting APK in ${out#"$REPO"/}"; return 1; }
+  ok "built:"
+  while IFS= read -r f; do
+    s="$(apk_cert "$f")"; vc="$(apk_vcode "$f")"
+    note "  ${f#"$REPO"/}${vc:+  (versionCode $vc)}"
+    if [ -z "$s" ]; then
+      warn "it is not signed — your release signing is not set up on this machine"
+      note "(the keystore your build.gradle reads, often through android/key.properties)"
+      return 1
+    fi
+    if apk_is_debug "$f"; then warn "it is signed with Android's debug key, not a release key"; return 1; fi
+    [ -n "$BUILT_SHA" ] || BUILT_SHA="$s"
+    [ "$s" = "$BUILT_SHA" ] || { warn "the APKs are signed with different keys"; return 1; }
+  done <<< "$BUILT_APKS"
+  # each one has to carry its build entry's versionCode
+  for n in $(seq 1 "$K"); do
+    want="$(fv "$RT/b/$n/versionCode")"; abi=""
+    [ "$K" -gt 1 ] && abi="$(entry_label "$n")"
+    if [ -n "$abi" ]; then f="$(printf '%s\n' "$BUILT_APKS" | grep -F -- "-$abi-" | sed -n 1p || true)"
+    else f="$(printf '%s\n' "$BUILT_APKS" | sed -n 1p)"; fi
+    if [ -z "$f" ]; then warn "no APK for ${abi:-the build entry} came out"; continue; fi
+    vc="$(apk_vcode "$f")"
+    if [ -n "$vc" ] && [ "$vc" != "$want" ]; then
+      warn "${f##*/} has versionCode $vc, the recipe $want — see the per-CPU numbering above"
+    fi
+  done
+  check_reference_apk "$(printf '%s\n' "$BUILT_APKS" | sed -n 1p)" built
+  return 0
+}
+
+# app_builds_dir — the builds/ folder of the app's project, when its repo lives
+# in a <project>/branches/<branch> layout: signed builds are kept there, where
+# they are easy to find
+app_builds_dir() {
+  local parent
+  parent="$(dirname "$REPO")"
+  if [ "$(basename "$parent")" = branches ]; then printf '%s/builds' "$(dirname "$parent")"; fi
+}
+
+# upload_release_apks — BUILT_APKS onto release $TAG, named as Binaries says
+upload_release_apks() {
+  local f abi code n name up=() notes="$WORK/release-notes.md" keep bdir
+  rm -rf "$WORK/upload"; mkdir -p "$WORK/upload"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    abi="$(apk_abi "${f##*/}")"; code="$VCODE"
+    if [ "$K" -gt 1 ]; then
+      for n in $(seq 1 "$K"); do
+        if [ "$(entry_label "$n")" = "$abi" ]; then code="$(fv "$RT/b/$n/versionCode")"; fi
+      done
+    fi
+    name="${BINARIES##*/}"; name="${name//%v/$VNAME}"; name="${name//%c/$code}"; name="${name//%abi/$abi}"
+    cp "$f" "$WORK/upload/$name"; up+=("$WORK/upload/$name")
+    note "  ${f##*/} → $name"
+  done <<< "$BUILT_APKS"
+  # a copy to keep: in your project's builds/ folder, or left in the scratch folder
+  keep="$WORK/upload"; bdir="$(app_builds_dir)"
+  if [ -n "$bdir" ] && mkdir -p "$bdir" && cp "${up[@]}" "$bdir/"; then
+    keep="$bdir"; ok "the signed APKs are in $bdir"
+  fi
+  [ "$keep" != "$WORK/upload" ] || KEEP_WORK=1
+  case "$BINARIES" in
+    "$WEB_GUESS/releases/download/"*) ;;
+    *) note "Binaries points elsewhere — put them there yourself; they are in $keep"
+       return 0 ;;
+  esac
+  if [ "$DRYRUN" = 1 ]; then warn "dry run — would put them on release $TAG"; return 0; fi
+  if [ "$FORGE_CLI" != gh ]; then
+    note "put them on release $TAG yourself ($WEB_GUESS/releases) — they are in $keep"
+    return 0
+  fi
+  if ! release_exists; then
+    if ! go "Release $TAG is not on GitHub yet — publish it, with these files?"; then
+      note "they are in $keep"; return 0
+    fi
+    if [ -f "${FL_BASE:-/nonexistent}/changelogs/$VCODE.txt" ]; then cp "$FL_BASE/changelogs/$VCODE.txt" "$notes"
+    else printf '%s\n' "$TAG" > "$notes"; fi
+    if ( cd "$REPO" && gh release create "$TAG" --title "$TAG" --notes-file "$notes" "${up[@]}" ) >/dev/null 2>&1; then
+      ok "release $TAG published, with the APKs"; remember ST_RELEASE "$TAG"
+    else
+      warn "gh could not publish it — the APKs are in $keep"
+    fi
+    return 0
+  fi
+  if ! go "Put them on release $TAG (replacing files of the same name)?"; then
+    note "they are in $keep"; return 0
+  fi
+  if ( cd "$REPO" && gh release upload "$TAG" "${up[@]}" --clobber ) >/dev/null 2>&1; then
+    ok "uploaded to release $TAG"
+  else
+    warn "gh could not upload them — they are in $keep"
+  fi
+}
+
+# --- the signing key's fingerprint: where it can be read from
+local_apks() {  # release APKs in this repo's build folders, newest first
+  local d
+  for d in ${FLUTTER_DIR:+"$REPO/$FLUTTER_DIR/build/app/outputs"} "$REPO/$SUBDIR/build/outputs" \
+           "$REPO/build" "$REPO/dist" "$REPO/release" "$REPO/releases"; do
+    if [ -d "$d" ]; then find "$d" -name '*.apk' -not -iname '*debug*' -printf '%T@ %p\n' 2>/dev/null; fi
+  done | sed 's#/\./#/#g' | sort -rn | awk '{ sub(/^[^ ]+ /, ""); if (!seen[$0]++) print }' | head -4
+}
+key_props() {  # the properties files your gradle build reads its release keystore from
+  local f
+  for f in "$REPO/android/key.properties" ${FLUTTER_DIR:+"$REPO/$FLUTTER_DIR/android/key.properties"} \
+           "$REPO/key.properties" "$REPO/keystore.properties" "$REPO/signing.properties" \
+           "$REPO/$SUBDIR/key.properties" "$REPO/$SUBDIR/keystore.properties"; do
+    if [ -f "$f" ] && grep -q 'storeFile' "$f" 2>/dev/null; then
+      printf '%s/%s\n' "$(cd "$(dirname "$f")" && pwd -P)" "$(basename "$f")"
+    fi
+  done | awk '!seen[$0]++'
+}
+keystore_cert() {  # keystore_cert <key.properties> — the key's fingerprint, read with keytool
+  local kp="$1" store alias pass base cand
+  have keytool || { warn "keytool (it comes with any JDK) is not installed"; return 1; }
+  store="$(sed -nE 's/^[[:space:]]*storeFile[[:space:]]*=[[:space:]]*//p' "$kp" | sed -n 1p | tr -d '\r')"
+  alias="$(sed -nE 's/^[[:space:]]*keyAlias[[:space:]]*=[[:space:]]*//p' "$kp" | sed -n 1p | tr -d '\r')"
+  pass="$(sed -nE 's/^[[:space:]]*storePassword[[:space:]]*=[[:space:]]*//p' "$kp" | sed -n 1p | tr -d '\r')"
+  store="${store/#\~/$HOME}"; base="$(dirname "$kp")"
+  # gradle reads it relative to the module that uses it: android/app, usually
+  for cand in "$store" "$base/app/$store" "$base/$store" "$REPO/$SUBDIR/$store"; do
+    case "$cand" in /*) if [ -f "$cand" ]; then store="$cand"; break; fi ;; esac
+  done
+  [ -f "$store" ] || { warn "the keystore it names is not here: $store"; return 1; }
+  if [ -z "$pass" ]; then
+    printf '   %sPassword of %s%s (not shown, not kept): ' "$B" "${store##*/}" "$R" >&2
+    IFS= read -rs pass || true; printf '\n' >&2
+  fi
+  FD_KS_PASS="$pass" keytool -list -v -keystore "$store" ${alias:+-alias "$alias"} -storepass:env FD_KS_PASS 2>/dev/null \
+    | awk '/SHA256:/ {print $2; exit}' | tr -d ':' | tr 'A-F' 'a-f'
+}
+
+# ask_signkey <APK address> <known key> <where it is from> — SIGNKEY, from
+# wherever it can be read: the APK on the release, one built here, the keystore.
+ask_signkey() {
+  local url="$1" known="$2" from="$3" choices=() acts=() a apk kp
+  printf '\n'
+  say "${B}AllowedAPKSigningKeys${R} — the fingerprint of the key you sign releases with."
+  say "F-Droid ships your APK only when it is signed with exactly this key. It is the"
+  say "SHA-256 of your signing certificate: 64 characters, 0-9 and a-f. Not a secret."
+  if [ -n "$known" ]; then choices+=("keep it — $from"$'\n'"$known"); acts+=(keep); fi
+  if [ -n "$url" ] && [ "$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 20 "$url" 2>/dev/null || true)" = 200 ]; then
+    choices+=("read it from the APK on release $TAG"$'\n'"downloads ${url##*/}"); acts+=(url)
+  fi
+  while IFS= read -r apk; do
+    [ -n "$apk" ] || continue
+    choices+=("read it from ${apk#"$REPO"/}"$'\n'"built $(date -r "$apk" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')")
+    acts+=("apk:$apk")
+  done < <(local_apks)
+  while IFS= read -r kp; do
+    [ -n "$kp" ] || continue
+    choices+=("read it from the keystore ${kp#"$REPO"/} names"$'\n'"with the passwords in that file, or it asks; nothing is kept")
+    acts+=("ks:$kp")
+  done < <(key_props)
+  choices+=("read it from another APK — give its path"); acts+=(path)
+  choices+=("type or paste it"); acts+=(type)
+  pick SIGN_SRC 1 "${choices[@]}"
+  a="${acts[$((SIGN_SRC - 1))]}"
+  SIGNKEY=""
+  case "$a" in
+    keep)  SIGNKEY="$known" ;;
+    url)   say "downloading ${url##*/}…"
+           if curl -sL --max-time 300 -o "$WORK/release.apk" "$url"; then
+             SIGNKEY="$(apk_cert "$WORK/release.apk")"; check_reference_apk "$WORK/release.apk"
+           fi ;;
+    apk:*) SIGNKEY="$(apk_cert "${a#apk:}")"; check_reference_apk "${a#apk:}" ;;
+    ks:*)  SIGNKEY="$(keystore_cert "${a#ks:}" || true)" ;;
+    path)  ask APKPATH "Path to your signed release APK" ""
+           APKPATH="${APKPATH/#\~/$HOME}"
+           if [ -f "$APKPATH" ]; then SIGNKEY="$(apk_cert "$APKPATH")"; check_reference_apk "$APKPATH"
+           else warn "no such file: $APKPATH"; fi ;;
+  esac
+  if [ -n "$SIGNKEY" ] && [ "$a" != keep ]; then ok "read it: $SIGNKEY"
+  elif [ -z "$SIGNKEY" ] && [ "$a" != type ]; then warn "could not read it from there"; fi
+  return 0
+}
+
 ask_publishing() {
-  local def=1 n abi b
+  local def=1 n abi b assets="" a pat_rel="" pat_usual="" derived choices=() acts=() act bdef url1="" known="" from=""
   { [ -f "$RD/top/Binaries" ] || [ -f "$RD/top/AllowedAPKSigningKeys" ] \
     || ls "$RT"/b/*/binary >/dev/null 2>&1; } && def=2
-  printf '\n'; say "${B}Publishing${R}"
-  say "  1) ${B}F-Droid builds and signs${R}  — F-Droid compiles from source and signs with"
-  say "     its own key. Simplest. Users get F-Droid's signature, so an app already"
-  say "     installed from your GitHub APK cannot update to it."
-  say "  2) ${B}Reproducible build${R}         — F-Droid rebuilds from source, checks the result"
-  say "     matches your signed APK, and ships YOUR APK. Keeps your signature."
-  say "     Needs Binaries: and AllowedAPKSigningKeys."
+  printf '\n'; say "${B}Publishing — whose signature your users get${R}"
+  say "  1) ${B}F-Droid builds and signs${R} — the simplest"
+  say "     F-Droid compiles the app from your source and signs it with its own key."
+  say "     Whoever installed your own APK (from GitHub, say) has to uninstall it"
+  say "     before F-Droid's will install: the signatures differ."
+  say "  2) ${B}Reproducible build${R} — keeps your signature"
+  say "     F-Droid compiles it too, checks the result is the same as your signed APK,"
+  say "     and ships yours. Users can move between F-Droid and your releases freely."
+  say "     It needs your signed APK on a release page, and your key's fingerprint."
   ask MODE "Which?" "$(r="$(recall MODE)"; printf '%s' "${r:-$def}")"
   tdone Binaries AllowedAPKSigningKeys
   if [ "$MODE" != 2 ]; then
@@ -3862,92 +4569,86 @@ ask_publishing() {
     for n in $(seq 1 "$K"); do rm -f "$RT/b/$n/binary" "$RT/b/$n/binary.k"; done
     return 0
   fi
-  # Name the file after the project, not the local checkout's folder.
+
+  # --- Binaries: your signed APK on the release page
+  printf '\n'
+  say "${B}Binaries${R} — the address F-Droid downloads your signed APK from, to compare it"
+  say "with its own build. It has placeholders F-Droid fills in for every version:"
+  say "  %v the versionName (now $VNAME) · %c the versionCode (now $VCODE)"
   if [ "$K" -gt 1 ]; then
-    note "use %v for the version and %abi for the CPU type, e.g."
-    note "  .../releases/download/v%v/App-%v-%abi.apk"
-    note "each CPU type gets its own build entry, so each gets its own binary: line"
-    ask BINARIES "Release APK URL pattern" \
-      "$(dflt Binaries "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/${WEB_GUESS##*/}-%v-%abi.apk}")"
-  else
-    note "use %v where the version goes, e.g. .../releases/download/v%v/App-%v.apk"
-    ask BINARIES "Binaries URL pattern" \
-      "$(dflt Binaries "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/${WEB_GUESS##*/}-%v.apk}")"
+    say "  %abi the CPU type — each of the $K build entries gets its own address"
   fi
-  SIGNKEY="$(sed -n 1p "$RD/top/AllowedAPKSigningKeys" 2>/dev/null || true)"
-  say "The signing certificate SHA-256 of your release APK is needed."
-  if confirm "Extract it from a local APK now?" "$([ -n "$SIGNKEY" ] && echo n || echo y)"; then
-    ask APKPATH "Path to your signed release APK" ""
-    APKPATH="${APKPATH/#\~/$HOME}"
-    if [ ! -f "$APKPATH" ]; then
-      warn "no such file: $APKPATH"
+  if [ -n "$WEB_GUESS" ]; then
+    # named after the project, not the local checkout's folder
+    pat_usual="$WEB_GUESS/releases/download/$(tag_pattern)/${WEB_GUESS##*/}-%v"
+    [ "$K" -gt 1 ] && pat_usual="$pat_usual-%abi"
+    pat_usual="$pat_usual.apk"
+    assets="$(release_assets "$TAG" | grep -iE '\.apk$' || true)"
+  fi
+  if [ -n "$assets" ]; then
+    if [ "$K" -gt 1 ]; then a="$(printf '%s\n' "$assets" | grep -E 'armeabi-v7a|arm64-v8a|x86_64' | sed -n 1p || true)"
+    else a="$(printf '%s\n' "$assets" | grep -vE 'armeabi-v7a|arm64-v8a|x86_64|x86' | sed -n 1p || true)"; fi
+    [ -z "$a" ] || pat_rel="$WEB_GUESS/releases/download/$(tag_pattern)/$(apk_pattern "$a")"
+  fi
+  if [ -n "$pat_rel" ]; then
+    choices+=("the one$([ "$K" -gt 1 ] && echo s) on release $TAG: $(printf '%s' "$assets" | tr '\n' ' ')"$'\n'"$pat_rel")
+    acts+=(rel)
+  fi
+  if can_build_here; then
+    if [ "$K" -gt 1 ]; then
+      choices+=("build them here now — one APK per CPU type, signed with your key — and put them on release $TAG")
     else
-      AS=""
-      if have apksigner; then AS="apksigner"
-      elif [ -n "${ANDROID_HOME:-}" ]; then
-        cand="$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | tail -1)"
-        [ -n "$cand" ] && [ -f "$cand/lib/apksigner.jar" ] && AS="java -jar $cand/lib/apksigner.jar"
-      fi
-      if [ -n "$AS" ]; then
-        SIGNKEY="$($AS verify --print-certs "$APKPATH" 2>/dev/null \
-                   | awk '/SHA-256 digest/ {print $NF; exit}')"
-      fi
-      # keytool ships with any JDK and reads the APK's signature block too
-      if [ -z "$SIGNKEY" ] && have keytool; then
-        SIGNKEY="$(keytool -printcert -jarfile "$APKPATH" 2>/dev/null \
-                   | awk '/SHA256:/ {print $2; exit}' | tr -d ':' | tr 'A-Z' 'a-z')"
-      fi
-      [ -n "$SIGNKEY" ] && ok "signing key: $SIGNKEY" || warn "could not read it automatically"
-      reference_apk_blocks "$APKPATH" | while IFS= read -r blk; do
-        [ -n "$blk" ] || continue
-        warn "the APK carries an extra signing block: $blk"
-        note "F-Droid's scanner refuses it — the \"check apk\" job fails once"
-        note "everything else has passed. Switch it off in the gradle file:"
-        note "  android { dependenciesInfo { includeInApk = false; includeInBundle = false } }"
-        note "that changes the APK, so it needs a new version and new binaries"
-      done
-      reference_apk_reproducible "$APKPATH" "$APPID" || \
-        confirm "Submit with reproducible builds anyway?" n || \
-        die "build the APK you publish at F-Droid's path first, then re-run"
+      choices+=("build it here now, signed with your key, and put it on release $TAG")
+    fi
+    acts+=(build)
+  fi
+  if [ -n "$pat_usual" ]; then
+    choices+=("you put it on the release yourself, named like this:"$'\n'"$pat_usual"); acts+=(later)
+  fi
+  choices+=("type the address yourself"); acts+=(type)
+  # the release's own files when it has them; building is offered, not assumed
+  bdef=1
+  for n in "${!acts[@]}"; do
+    if [ "${acts[$n]}" = later ]; then bdef=$((n + 1)); fi
+  done
+  [ "${acts[0]}" = rel ] && bdef=1
+  pick BIN_SRC "$bdef" "${choices[@]}"
+  act="${acts[$((BIN_SRC - 1))]}"
+  case "$act" in
+    rel)  derived="$pat_rel" ;;
+    *)    derived="$(recall BINARIES)"; [ -n "$derived" ] || derived="$(dflt Binaries "")"
+          [ -n "$derived" ] || [ "$act" = type ] || derived="$pat_usual" ;;
+  esac
+  [ "$act" = type ] || note "Enter keeps it; change it if your file names differ"
+  while :; do
+    ask BINARIES "Binaries" "$derived"
+    case "$BINARIES" in
+      https://*) ;;
+      *) [ "$ASSUME_YES" = 1 ] && die "Binaries has to be an https:// address"
+         warn "it has to be an https:// address"; derived=""; remember BINARIES ""; continue ;;
+    esac
+    case "$BINARIES" in
+      *%v*|*%c*) ;;
+      *) warn "without %v (or %c) it names this version only — every update would need a new one" ;;
+    esac
+    if [ "$K" -gt 1 ]; then
+      case "$BINARIES" in *%abi*) ;; *) warn "without %abi all $K CPU types point at the same file" ;; esac
+    fi
+    break
+  done
+  if [ "$act" = build ]; then
+    if build_release_apks; then
+      known="$BUILT_SHA"; from="from the APK$([ "$K" -gt 1 ] && echo s) just built"
+      upload_release_apks
+    else
+      note "carrying on without a fresh build — put your APK on the release yourself"
     fi
   fi
-  # 64 hex characters. apksigner and keytool print it in capitals or with
-  # colons, which F-Droid does not take: cleaned up here. Anything else is
-  # asked again, and a wrong one is never remembered as next time's default.
-  sigclean() { printf '%s' "$1" | tr -d ': ' | tr 'A-F' 'a-f'; }
-  sigok() { printf '%s' "$1" | grep -qE '^[0-9a-f]{64}$'; }
-  SIGNKEY="$(sigclean "$SIGNKEY")"
-  sigok "$SIGNKEY" || SIGNKEY="$(sigclean "$(recall SIGNKEY)")"
-  sigok "$SIGNKEY" || { SIGNKEY=""; remember SIGNKEY ""; }
-  while :; do
-    ask SIGNKEY "AllowedAPKSigningKeys (the certificate's SHA-256: 64 hex characters)" "$SIGNKEY"
-    SIGNKEY="$(sigclean "$SIGNKEY")"
-    sigok "$SIGNKEY" && break
-    remember SIGNKEY ""
-    [ "$ASSUME_YES" = 1 ] && die "AllowedAPKSigningKeys has to be 64 hex characters"
-    warn "that is not a SHA-256 fingerprint: it is 64 hex characters (0-9, a-f)"
-    note "read it off your signed release APK: apksigner verify --print-certs app.apk"
-    note "(the \"SHA-256 digest\" line), or keytool -printcert -jarfile app.apk"
-    SIGNKEY=""
-  done
-  remember SIGNKEY "$SIGNKEY"
-  rset top/AllowedAPKSigningKeys l "$SIGNKEY"
-  # F-Droid downloads this APK to compare its own build with, so check that it
-  # is really there for this version — a missing asset, a name that differs
-  # from the pattern, or a private repo all fail the reproducible-build check.
-  binary_there() {  # binary_there <url> — say whether the APK can be downloaded
-    local code
-    code="$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 20 "$1" 2>/dev/null || true)"
-    case "$code" in
-      200) ok "found the APK: $1" ;;
-      404) warn "no APK at $1"
-           note "upload the signed APK to the release, or fix the pattern — F-Droid needs to download it" ;;
-      *)   note "could not check $1 (HTTP ${code:-none})" ;;
-    esac
-  }
+
   # Binaries: is one app-level pattern and only knows %v and %c, so it cannot
   # name per-ABI release assets. fdroidserver takes `build.binary or
   # app.Binaries`, so with a split each entry carries its own binary: line.
+  # F-Droid downloads these to compare its build with, so each is checked.
   if [ "$K" -gt 1 ]; then
     rdel top/Binaries
     for n in $(seq 1 "$K"); do
@@ -3955,14 +4656,39 @@ ask_publishing() {
              | grep -oE 'armeabi-v7a|arm64-v8a|x86_64|x86' | sed -n 1p || true)"
       b="$BINARIES"; [ -n "$abi" ] && b="${b//%abi/$abi}"
       printf '%s\n' "$b" > "$RT/b/$n/binary"; echo s > "$RT/b/$n/binary.k"
-      b="${b//%v/$VNAME}"; binary_there "${b//%c/$(fv "$RT/b/$n/versionCode")}"
+      b="${b//%v/$VNAME}"; b="${b//%c/$(fv "$RT/b/$n/versionCode")}"
+      [ -n "$url1" ] || url1="$b"
+      if [ "$DRYRUN" = 0 ] || [ "$act" != build ]; then binary_there "$b"; fi
     done
     ok "each build entry points at its own APK on the release page"
   else
     rset top/Binaries s "$BINARIES"
-    b="${BINARIES//%v/$VNAME}"; binary_there "${b//%c/$VCODE}"
+    b="${BINARIES//%v/$VNAME}"; url1="${b//%c/$VCODE}"
+    if [ "$DRYRUN" = 0 ] || [ "$act" != build ]; then binary_there "$url1"; fi
     for n in $(seq 1 "$K"); do rm -f "$RT/b/$n/binary" "$RT/b/$n/binary.k"; done
   fi
+
+  # --- AllowedAPKSigningKeys: 64 hex characters. apksigner and keytool print
+  # it in capitals or with colons, which F-Droid does not take: cleaned up
+  # here. Anything else is asked again, and a wrong one is never remembered.
+  if [ -z "$known" ]; then
+    known="$(sigclean "$(sed -n 1p "$RD/top/AllowedAPKSigningKeys" 2>/dev/null || true)")"; from="the one in $BASE_LABEL"
+    sigok "$known" || { known="$(sigclean "$(recall SIGNKEY)")"; from="your answer last time"; }
+    sigok "$known" || known=""
+  fi
+  ask_signkey "$url1" "$known" "$from"
+  SIGNKEY="$(sigclean "$SIGNKEY")"
+  while ! sigok "$SIGNKEY"; do
+    [ "$ASSUME_YES" = 1 ] && die "AllowedAPKSigningKeys has to be 64 hex characters"
+    [ -z "$SIGNKEY" ] || warn "that is not a SHA-256 fingerprint: it is 64 hex characters (0-9, a-f)"
+    note "apksigner verify --print-certs app.apk prints it, on its \"SHA-256 digest\" line"
+    remember SIGNKEY ""
+    ask SIGNKEY "AllowedAPKSigningKeys" ""
+    SIGNKEY="$(sigclean "$SIGNKEY")"
+  done
+  remember SIGNKEY "$SIGNKEY"
+  ok "AllowedAPKSigningKeys: $SIGNKEY"
+  rset top/AllowedAPKSigningKeys l "$SIGNKEY"
 }
 
 # --- the build entries, line by line
@@ -4051,28 +4777,193 @@ ask_build_entries() {
 }
 
 # --- how F-Droid learns about new versions, and which one is current
-ask_update_checks() {
-  local ucm aum k src
-  printf '\n'; say "${B}Updates${R}"
-  ucm="$(dflt UpdateCheckMode "")"
-  if [ -z "$ucm" ]; then ucm=Tags; [ "${MANIFESTS:-0}" -gt 20 ] && ucm=None; fi
-  yline top/UpdateCheckMode top "$ucm" req
-  aum="$(dflt AutoUpdateMode "")"
-  if [ -z "$aum" ]; then
-    aum=Version; [ "$(fv "$RR/top/UpdateCheckMode")" = None ] && aum=None
-    case "$TAG" in
-      "$VNAME"|"v$VNAME") ;;
-      *) warn "tag '$TAG' is neither '$VNAME' nor 'v$VNAME'"
-         note "UpdateCheckMode: Tags takes the newest tag whatever it is called, so"
-         note "'Version' still works; answer None to update the metadata by hand" ;;
-    esac
+# ychoose <rel> <scope> <default> req|opt <choice>… — a one-line field as a
+# menu. Each choice is "value TAB what it means"; an empty value leaves the
+# field out. A number picks one; anything else typed is taken as the value.
+ychoose() {
+  local rel="$1" scope="$2" def req="$4" name="${1##*/}" c v l i=1 n defn="" ch vals=()
+  def="$(ymem "$rel" "$3")"; shift 4
+  if [ "$ASSUME_YES" = 1 ]; then
+    [ -z "$def" ] && [ "$req" = req ] && die "--yes: nothing to answer $name with — run once without --yes"
+    [ -n "$def" ] && ok "$name: $def"
+    ysave "$rel" s "$def"; return 0
   fi
-  yline top/AutoUpdateMode top "$aum" req
-  for k in UpdateCheckIgnore VercodeOperation UpdateCheckName UpdateCheckData; do
+  yhint "$scope" "$name" "$def"
+  for c in "$@"; do
+    v="${c%%$'\t'*}"; l="${c#*$'\t'}"
+    if [ -z "$v" ]; then printf '     %d) %s\n' "$i" "$l"
+    elif [ "${#v}" -le 24 ]; then printf '     %d) %s%s%s — %s\n' "$i" "$B" "$v" "$R" "$l"
+    else printf '     %d) %s\n        %s%s%s\n' "$i" "$l" "$DIM" "$v" "$R"; fi
+    vals+=("$v")
+    if [ -z "$defn" ] && [ "$v" = "$def" ]; then defn="$i"; fi
+    i=$((i + 1))
+  done
+  if [ -n "$def" ] && [ -z "$defn" ]; then
+    printf '     %d) %s\n        %s%s%s\n' "$i" "keep the current one" "$DIM" "$def" "$R"
+    vals+=("$def"); defn="$i"; i=$((i + 1))
+  fi
+  printf '     %d) %s\n' "$i" "type your own"
+  n="$i"; defn="${defn:-1}"
+  while :; do
+    printf '   %s%s%s [%s]: ' "$B" "$name" "$R" "$defn" >&2
+    readline ch; ch="$(trim "$ch")"; ch="${ch:-$defn}"
+    case "$ch" in
+      *[!0-9]*) v="$ch" ;;
+      *) if [ "$ch" -ge 1 ] && [ "$ch" -lt "$n" ]; then v="${vals[$((ch - 1))]}"
+         elif [ "$ch" = "$n" ]; then
+           printf '   %s%s%s: ' "$B" "$name" "$R" >&2; readline v; v="$(trim "$v")"
+         else warn "a number from 1 to $n"; continue; fi ;;
+    esac
+    [ "$v" = - ] && v=""
+    if [ -z "$v" ]; then
+      if [ "$req" = req ]; then warn "$name is needed"; continue; fi
+      break
+    fi
+    ycheck "$scope" "$name" "$v" && break
+  done
+  ysave "$rel" s "$v"
+}
+
+ucm_tagpat() {  # a Tags pattern matching release tags like this one only
+  case "$TAG" in
+    v[0-9]*) printf '%s' '^v[0-9.]+$' ;;
+    [0-9]*)  printf '%s' '^[0-9.]+$' ;;
+    *)       printf '%s' '^v?[0-9.]+$' ;;
+  esac
+}
+ucm_default() {  # what this repo suggests for UpdateCheckMode
+  local other
+  if [ "${MANIFESTS:-0}" -gt 20 ]; then printf 'None'; return 0; fi
+  # tags that are not releases (beta-…, nightly) would be taken for one
+  other="$(git -C "$REPO" tag -l 2>/dev/null | grep -cvE '^v?[0-9]+(\.[0-9]+)*$' || true)"
+  if [ "${other:-0}" -gt 0 ]; then printf 'Tags %s' "$(ucm_tagpat)"; else printf 'Tags'; fi
+}
+
+# ucd_options — UpdateCheckData choices read off the repo, "value TAB what it means"
+ucd_options() {
+  local pub ref lit=""
+  ref="$TAG"; git -C "$REPO" rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1 || ref=HEAD
+  if [ -n "$FLUTTER_DIR" ]; then
+    pub="pubspec.yaml"; [ "$FLUTTER_DIR" != "." ] && pub="$FLUTTER_DIR/pubspec.yaml"
+    printf '%s|version:\\s.+\\+(\\d+)|.|version:\\s(.+)\\+\t%s\n' "$pub" \
+      "both from the version: line of $pub (now $VNAME+$VCODE) — what Flutter apps use"
+  fi
+  if [ -z "$FLUTTER_DIR" ] && [ "$(gval versionCode)" = "$VCODE" ]; then
+    lit=1
+    printf '\t%s\n' "none — F-Droid reads them from $GRADLE_REL, where they are plain values"
+  fi
+  # another file that holds them: gradle.properties, version.properties, a catalog…
+  python3 - "$REPO" "$ref" "$VNAME" "$VCODE" "${lit:+$GRADLE_REL}" <<'PYUCD' 2>/dev/null || true
+import re, subprocess, sys
+repo, ref, vname, vcode, skip = sys.argv[1:6]
+
+
+def git(*a):
+    return subprocess.run(['git', '-C', repo] + list(a), capture_output=True).stdout.decode('utf-8', 'replace')
+
+
+WANT = re.compile(r'(^|/)(gradle\.properties|[\w.-]*version[\w.-]*\.(properties|toml|json|txt|gradle|kts|ya?ml)'
+                  r'|build\.gradle(\.kts)?)$', re.I)
+files = [f for f in git('ls-tree', '-r', '--name-only', ref).split('\n')
+         if f and f != skip and WANT.search(f) and 'node_modules/' not in f][:300]
+KEYC = r'[\w.-]*(?:version_?code|ver_?code|v_?code|build_?number)[\w.-]*'
+KEYN = r'[\w.-]*(?:version_?name|ver_?name|v_?name)[\w.-]*'
+
+
+def hits(text, key, value):
+    pat = re.compile(r'^[ \t]*(?:def |val |var |const val )?["\']?(' + key + r')["\']?[ \t]*([=:])[ \t]*(["\']?)'
+                     + re.escape(value) + r'(?![\w.])', re.M | re.I)
+    return [m.groups() for m in pat.finditer(text)]
+
+
+def rx(key, sep, q, cap):
+    return re.escape(key) + r'\s*' + re.escape(sep) + r'\s*' + re.escape(q) + cap
+
+
+texts = {f: git('show', '%s:%s' % (ref, f)) for f in files}
+seen = set()
+for f in files:
+    for key, sep, q in hits(texts[f], KEYC, vcode):
+        for g in [f] + [x for x in files if x != f]:
+            h = hits(texts[g], KEYN, vname)
+            if not h:
+                continue
+            k2, s2, q2 = h[0]
+            cap = '([^%s]+)' % q2 if q2 else r'(\S+)'
+            val = '%s|%s|%s|%s' % (f, rx(key, sep, q, r'(\d+)'), '.' if g == f else g, rx(k2, s2, q2, cap))
+            if val not in seen:
+                seen.add(val)
+                print('%s\t%s' % (val, 'both from %s' % f if g == f
+                                  else 'versionCode from %s, versionName from %s' % (f, g)))
+            break
+PYUCD
+  if [ -z "$lit" ]; then
+    printf '\t%s\n' "none — F-Droid reads $GRADLE_REL, which works only where versionCode is a plain number there"
+  fi
+}
+
+ask_ucd() {
+  local cur="" opts=() line
+  case "$(fv "$RR/top/UpdateCheckMode")" in
+    None|Static)
+      # nothing reads it without update checks
+      if [ ! -f "$RD/top/UpdateCheckData" ]; then rdel top/UpdateCheckData; return 0; fi ;;
+  esac
+  printf '\n'
+  say "${B}UpdateCheckData${R} — where the check reads a new tag's version numbers."
+  say "Without it, F-Droid looks for versionCode and versionName in $GRADLE_REL, which"
+  say "works only when they are written there as plain values. Four parts, joined by |:"
+  note "  the file with the versionCode | a pattern that finds it |"
+  note "  the file with the versionName (. means the same file) | a pattern that finds it"
+  if [ -f "$RD/top/UpdateCheckData" ]; then cur="$(fv "$RD/top/UpdateCheckData")"
+  elif [ -f "$RG/top/UpdateCheckData" ]; then cur="$(fv "$RG/top/UpdateCheckData")"; fi
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then opts+=("$line"); fi
+  done < <(ucd_options)
+  ychoose top/UpdateCheckData top "$cur" opt ${opts[@]+"${opts[@]}"}
+}
+
+ask_update_checks() {
+  local ucm aum ver k src
+  printf '\n'; say "${B}Updates${R} — how F-Droid notices your next versions"
+  say "F-Droid's bot looks at your repo about once a day. These lines tell it where to"
+  say "find a new version, and whether to add that version to the recipe by itself —"
+  say "then a new release needs nothing from you but a pushed tag."
+  printf '\n'; say "${B}UpdateCheckMode${R} — where it looks for a new version:"
+  ucm="$(dflt UpdateCheckMode "")"; [ -n "$ucm" ] || ucm="$(ucm_default)"
+  ychoose top/UpdateCheckMode top "$ucm" req \
+    "Tags"$'\t'"the newest git tag — right when every release is tagged (yours: $TAG)" \
+    "Tags $(ucm_tagpat)"$'\t'"only tags that look like a release, so beta-…, nightly-… tags are passed over" \
+    "RepoManifest"$'\t'"the version in your default branch's build files — for repos that tag nothing" \
+    "None"$'\t'"no checking — you send every update yourself"
+  ucm="$(fv "$RR/top/UpdateCheckMode")"
+  printf '\n'; say "${B}AutoUpdateMode${R} — what it does when it finds one:"
+  aum="$(dflt AutoUpdateMode "")"
+  case "$ucm" in
+    None|Static)
+      ychoose top/AutoUpdateMode top "${aum:-None}" req \
+        "None"$'\t'"nothing — without update checks there is nothing to act on" ;;
+    Tags*)
+      ychoose top/AutoUpdateMode top "${aum:-Version}" req \
+        "Version"$'\t'"adds the new tag's version to the recipe and builds it — no merge request from you" \
+        "None"$'\t'"only notes it; you send a merge request for each update" ;;
+    *)
+      ver="Version $(tag_pattern)"
+      ychoose top/AutoUpdateMode top "${aum:-$ver}" req \
+        "$ver"$'\t'"adds the new version and builds the tag $(tag_pattern) names (%v: the version) — no merge request from you" \
+        "None"$'\t'"only notes it; you send a merge request for each update" ;;
+  esac
+  case "$TAG" in
+    "$VNAME"|"v$VNAME") ;;
+    *) note "your tag '$TAG' is neither '$VNAME' nor 'v$VNAME' — fine with Tags, which builds the tag it"
+       note "finds; a pattern has to say where the version goes in your tags" ;;
+  esac
+  for k in UpdateCheckIgnore VercodeOperation UpdateCheckName; do
     src=""
     if [ -f "$RD/top/$k" ]; then src="$RD/top/$k"; elif [ -f "$RG/top/$k" ]; then src="$RG/top/$k"; fi
-    [ -n "$src" ] && yfield "top/$k" top "$(akind top "$k" "$src")" "$(fv "$src")"
+    if [ -n "$src" ]; then printf '\n'; yfield "top/$k" top "$(akind top "$k" "$src")" "$(fv "$src")"; fi
   done
+  ask_ucd
   tdone UpdateCheckMode AutoUpdateMode UpdateCheckIgnore VercodeOperation UpdateCheckName UpdateCheckData
 }
 ask_current_version() {
@@ -4170,11 +5061,277 @@ YMLSUM="$(cksum < "$FDROIDDATA/metadata/$APPID.yml")"
 ok "wrote $FDROIDDATA/metadata/$APPID.yml"
 save_answers
 
-# ================================================================ 4. validate
-step "4/5  Validation"
+# ================================================================ 4. checks
+# The checks fdroiddata's pipeline runs on a merge request, run here first with
+# the same fdroidserver, so the pipeline finds nothing new: fdroid lint, fdroid
+# rewritemeta, schema validation, git redirect, tools check scripts and
+# checkupdates — and fdroid build, where this machine can run it and you ask.
+# Whatever cannot run here is said so, and left to the pipeline.
+step "4/5  Checks — what fdroiddata's pipeline runs, run here first"
+
+# The pipeline's "tools check scripts" job: two of its scripts concern one
+# recipe. A Summary: line fails it (make-summary-translatable.py) — F-Droid
+# takes the summary from fastlane — and so does a signing-key alias shared with
+# another app, since F-Droid derives the alias from the application id.
+summary_check() {
+  local f="$FDROIDDATA/metadata/$APPID.yml" ka="" bad=""
+  if grep -q '^Summary:' "$f"; then
+    warn "the recipe has a Summary: line — fdroiddata's pipeline fails on it"
+    note "F-Droid shows short_description.txt from your repo's fastlane instead"
+    if confirm "Take the Summary: line out?" y; then
+      python3 - "$f" <<'PYSUM'
+import sys
+p = sys.argv[1]
+out, skip = [], False
+for l in open(p, encoding='utf-8').read().split('\n'):
+    if l.startswith('Summary:'):
+        skip = True
+        continue
+    if skip and l.startswith((' ', '\t')):
+        continue
+    skip = False
+    if not l.strip() and out and not out[-1].strip():
+        continue
+    out.append(l)
+open(p, 'w', encoding='utf-8').write('\n'.join(out))
+PYSUM
+      remember "$(mkey top/Summary)" -
+      ok "took it out"
+    else
+      bad="a Summary: line"
+    fi
+  fi
+  if [ "$IS_UPDATE" = 0 ]; then
+    ka="$(cd "$FDROIDDATA" && python3 - "$APPID" <<'PYKA' 2>/dev/null || true
+import glob, hashlib, os, sys
+alias = lambda s: hashlib.md5(s.encode()).hexdigest()[:8]
+me = sys.argv[1]
+for f in sorted(glob.glob('metadata/*.yml')):
+    other = os.path.basename(f)[:-4]
+    if other != me and alias(other) == alias(me):
+        print(other)
+PYKA
+)"
+    if [ -n "$ka" ]; then
+      warn "$APPID's signing-key alias is the same as $ka's — the pipeline stops on it"
+      note "F-Droid derives each app's key alias from its id: only another application id avoids it"
+      bad="${bad:+$bad, }a key alias shared with $ka"
+    fi
+  fi
+  if [ -n "$bad" ]; then chk "tools check scripts" "failed: $bad"; VALID_FAIL="${VALID_FAIL:-} tools"
+  else chk "tools check scripts" passed; fi
+}
+
+# fdroiddata's pipeline validates every changed recipe against
+# schemas/metadata.json before anything else. lint does not, so a recipe lint
+# is happy with can still be turned away. The same validator where there is
+# one — check-jsonschema, also run through uvx, pipx or nix when it is not
+# installed — else the python one.
+cat > "$WORK/schema.py" <<'PYSCHEMA'
+import json, sys, jsonschema, yaml
+schema = json.load(open(sys.argv[1]))
+doc = yaml.safe_load(open(sys.argv[2]))
+errors = sorted(jsonschema.Draft7Validator(schema).iter_errors(doc), key=lambda e: list(e.path))
+for e in errors:
+    print("   $." + ".".join(str(p) for p in e.path) + ": " + e.message)
+sys.exit(1 if errors else 0)
+PYSCHEMA
+printf 'import jsonschema, yaml\n' > "$WORK/has-jsonschema.py"
+schema_check() {
+  local rel="metadata/$APPID.yml" run py t=""
+  if [ ! -f "$FDROIDDATA/schemas/metadata.json" ]; then
+    chk "schema validation" "skipped: no schemas/metadata.json in the clone"; return 0
+  fi
+  have timeout && t="timeout 600"
+  for run in check-jsonschema "uvx check-jsonschema" "pipx run check-jsonschema" \
+             "nix --extra-experimental-features nix-command --extra-experimental-features flakes run nixpkgs#check-jsonschema --"; do
+    have "${run%% *}" || continue
+    if [ "${run%% *}" = check-jsonschema ]; then say "schema validation — check-jsonschema"
+    else
+      say "schema validation — check-jsonschema, through ${run%% *}"
+      note "(the first time, ${run%% *} fetches it: a minute or two)"
+    fi
+    # shellcheck disable=SC2086
+    if ( cd "$FDROIDDATA" && $t $run --schemafile schemas/metadata.json "$rel" ) > "$WORK/schema.log" 2>&1; then
+      chk "schema validation" passed; return 0
+    fi
+    if grep -qiE 'validation errors|failed validating|is not valid' "$WORK/schema.log"; then
+      sed 's/^/     /' "$WORK/schema.log" | tail -n 20
+      VALID_FAIL="$VALID_FAIL schema"; chk "schema validation" "failed: see above"; return 0
+    fi
+    note "it did not run — trying another way"
+  done
+  for py in "$FDROID_PY" python3; do
+    [ -n "$py" ] || continue
+    "$py" "$WORK/has-jsonschema.py" >/dev/null 2>&1 || continue
+    say "schema validation — python jsonschema"
+    if "$py" "$WORK/schema.py" "$FDROIDDATA/schemas/metadata.json" "$FDROIDDATA/$rel" > "$WORK/schema.log" 2>&1; then
+      chk "schema validation" passed
+    else
+      sed 's/^/     /' "$WORK/schema.log"
+      VALID_FAIL="$VALID_FAIL schema"; chk "schema validation" "failed: see above"
+    fi
+    return 0
+  done
+  note "no JSON schema validator here — pipx install check-jsonschema adds one"
+  chk "schema validation" "skipped: no validator here — the pipeline runs it"
+}
+
+# The pipeline's "git redirect" job: Repo: has to be the address git lands on,
+# not one that redirects there (a renamed or moved repo). Its own tool fixes
+# the line; what it changes is kept.
+redirect_check() {
+  local f="$FDROIDDATA/metadata/$APPID.yml" before new had=0
+  if [ ! -f "$FDROIDDATA/tools/rewrite-git-redirects.py" ]; then
+    chk "git redirect" "skipped: no tools/rewrite-git-redirects.py in the clone"; return 0
+  fi
+  say "git redirect — Repo: is where git lands, not an address that redirects"
+  [ -e "$FDROIDDATA/codequality.json" ] && had=1
+  before="$(cksum < "$f")"
+  if fpy tools/rewrite-git-redirects.py "$APPID" > "$WORK/redirect.log" 2>&1; then
+    if [ "$before" != "$(cksum < "$f")" ]; then
+      new="$(sed -n 's/^Repo:[[:space:]]*//p' "$f" | sed -n 1p)"
+      warn "Repo: redirected — it is now the address git lands on: $new"
+      remember "$(mkey top/Repo)" "$new"
+      chk "git redirect" "passed: Repo: is now $new"
+    else
+      chk "git redirect" passed
+    fi
+  else
+    tail -n 5 "$WORK/redirect.log" | sed 's/^/     /'
+    chk "git redirect" "skipped: the tool did not run here — the pipeline runs it"
+  fi
+  [ "$had" = 1 ] || rm -f "$FDROIDDATA/codequality.json"
+  # it also looks at the srclibs the build uses: not this merge request's to change
+  git -C "$FDROIDDATA" checkout -q -- srclibs 2>/dev/null || true
+}
+
+# The pipeline's "checkupdates" job runs `fdroid checkupdates --auto` on the
+# recipe and fails on any change it makes: AutoName read off the app's
+# manifest, a newer tag than the one sent… Run here the same way, whatever it
+# changes is kept, so the pipeline finds nothing left to change. It clones the
+# app, so give it a moment. Three traps, none of them yours:
+#  * fdroiddata's config.yml is F-Droid's production config, with serverwebroot
+#    and the signing keys as {env: …} placeholders their pipeline fills in;
+#    here checkupdates logs an ERROR about the blank serverwebroot while doing
+#    its work perfectly well. A throwaway one keeps it quiet.
+#  * with -v it exits non-zero if any ERROR was logged, which turns that
+#    harmless complaint into a failure. The log is read instead.
+#  * without --allow-dirty it refuses to run while the clone holds a change —
+#    and the recipe is one, uncommitted until stage 5.
+checkupdates_check() {
+  local f="$FDROIDDATA/metadata/$APPID.yml" errs cvb cva
+  say "fdroid checkupdates --auto $APPID — what the pipeline's update check would change"
+  note "it clones your app: a minute or so"
+  cp "$f" "$WORK/pre-checkupdates.yml"
+  # rsync will not create nested folders, and it deploys into repo/status/
+  mkdir -p "$WORK/deploy-sink/repo/status"
+  if serverwebroot="$WORK/deploy-sink" \
+     frun checkupdates --auto --allow-dirty "$APPID" > "$WORK/checkupdates.log" 2>&1; then
+    # it writes the file with the local fdroid's layout: put the pipeline's back
+    rcp ciwrap "$f" >/dev/null || true
+    errs="$(grep -c 'ERROR' "$WORK/checkupdates.log" || true)"
+    if [ "${errs:-0}" -gt 0 ]; then
+      note "it logged $errs error(s) — usually fdroiddata's config.yml wanting F-Droid's own"
+      note "deploy setup, which only their pipeline has:"
+      grep 'ERROR' "$WORK/checkupdates.log" | head -3 | sed 's/^/       /'
+    fi
+    if cmp -s "$f" "$WORK/pre-checkupdates.yml"; then
+      chk checkupdates "passed: nothing to change"
+    else
+      note "it changed the recipe the way the pipeline would — kept, so the pipeline finds nothing:"
+      diff -u "$WORK/pre-checkupdates.yml" "$f" | sed -n 's/^\([+-][^+-]\)/     \1/p' || true
+      cvb="$(sed -n 's/^CurrentVersionCode:[[:space:]]*//p' "$WORK/pre-checkupdates.yml")"
+      cva="$(sed -n 's/^CurrentVersionCode:[[:space:]]*//p' "$f")"
+      if [ "$cvb" != "$cva" ]; then
+        warn "it found a newer version than $VNAME tagged in your repo, and added it"
+      fi
+      chk checkupdates "passed: it filled in what the pipeline expects"
+    fi
+  else
+    warn "checkupdates could not run:"
+    tail -n 5 "$WORK/checkupdates.log" | sed 's/^/     /'
+    chk checkupdates "skipped: it could not run here — the pipeline runs it"
+  fi
+}
+
+# The pipeline's "check apk" job, for reproducible builds: it scans the APK
+# F-Droid would ship — yours, downloaded from the binary: address — with fdroid
+# scanner (non-free libraries, trackers, extra signing blocks, debuggable or
+# test-only builds), and turns away one signed with Android's debug key. When
+# F-Droid signs, it scans what it builds itself: nothing to do here.
+apk_scan_check() {
+  local n u vc f code i=0 bad=0 away=0 urls=()
+  for n in $(seq 1 "$K"); do
+    u="$(fv "$RR/b/$n/binary")"; [ -n "$u" ] || u="$(fv "$RR/top/Binaries")"
+    [ -n "$u" ] || continue
+    vc="$(fv "$RR/b/$n/versionCode")"; u="${u//%v/$VNAME}"; urls+=("${u//%c/$vc}")
+  done
+  [ "${#urls[@]}" -gt 0 ] || return 0
+  if [ "$FD_SCANNER_OK" = 0 ]; then
+    chk "check apk" "skipped: fdroidserver's scanner does not load here — the pipeline scans them"; return 0
+  fi
+  say "check apk — your ${#urls[@]} release APK(s), scanned the way the pipeline scans them"
+  for u in "${urls[@]}"; do
+    i=$((i + 1)); f="$WORK/scan-$i-${u##*/}"
+    code="$(curl -sL --max-time 300 -o "$f" -w '%{http_code}' "$u" 2>/dev/null || true)"
+    if [ "$code" != 200 ]; then
+      if [ "$code" = 404 ]; then
+        warn "${u##*/} is not on the release yet — F-Droid downloads it from $u"; bad=$((bad + 1))
+      else
+        note "could not download $u (HTTP ${code:-none}) — offline?"; away=$((away + 1))
+      fi
+      continue
+    fi
+    if frun scanner --verbose --exit-code "$f" > "$WORK/scan-$i.log" 2>&1; then
+      ok "${u##*/}: nothing found"
+    else
+      warn "${u##*/}: the scanner found problems:"
+      grep -E 'ERROR|CRITICAL|Problem|Found class' "$WORK/scan-$i.log" | sed 's/^[0-9-]* [0-9:,]* //' \
+        | sort -u | head -8 | sed 's/^/       /'
+      bad=$((bad + 1))
+    fi
+    if apk_is_debug "$f"; then warn "${u##*/} is signed with Android's debug key"; bad=$((bad + 1)); fi
+  done
+  if [ "$bad" -gt 0 ]; then chk "check apk" "failed: $bad problem(s), listed above"
+  elif [ "$away" -gt 0 ]; then chk "check apk" "skipped: the APKs could not be downloaded here — the pipeline scans them"
+  else chk "check apk" "passed: ${#urls[@]} APK(s) scanned"; fi
+}
+
+# The pipeline's "check source code" job: fdroiddata's own tools/check-fastlane.py,
+# when the library it needs is here. Otherwise the listing was checked in the
+# Pitfall check, the same way.
+fastlane_tool_check() {
+  local lvl msg crit=0
+  [ -f "$FDROIDDATA/tools/check-fastlane.py" ] || return 0
+  printf 'import markdown_it\n' > "$WORK/has-markdown.py"
+  "$FDROID_PY" "$WORK/has-markdown.py" >/dev/null 2>&1 || return 0
+  say "check source code — the listing, as the reviewers will see it"
+  if ! fpy tools/check-fastlane.py "$APPID" > "$WORK/fastlane.json" 2> "$WORK/fastlane.log"; then
+    note "it did not run — the listing was checked above, in the Pitfall check"; return 0
+  fi
+  while IFS=$'\t' read -r lvl msg; do
+    case "$lvl" in
+      critical) warn "$msg"; crit=$((crit + 1)) ;;
+      major)    warn "$msg" ;;
+      *)        note "$msg" ;;
+    esac
+  done < <(python3 -c '
+import json, sys
+for r in json.load(open(sys.argv[1])):
+    print("%s\t%s" % (r.get("severity", ""), r.get("description", "")))
+' "$WORK/fastlane.json" 2>/dev/null || true)
+  if [ "$crit" -gt 0 ]; then chk "check source code (the listing)" "failed: $crit thing(s) missing, listed above"
+  else chk "check source code (the listing)" passed; fi
+}
+
 if [ "$RUNNER" = none ]; then
-  warn "no fdroidserver — skipping readmeta/rewritemeta/lint"
-  warn "the maintainers' CI will run these anyway, so expect to fix what it reports"
+  VALID_FAIL=""
+  summary_check
+  note "fdroidserver does not run here, so these are left to the merge request's pipeline"
+  for c in "fdroid lint" "fdroid rewritemeta" "schema validation" "git redirect" checkupdates "fdroid build"; do
+    chk "$c" "skipped: left to the pipeline"
+  done
 else
   VALIDATE_AGAIN=1
   VALID_ROUNDS=0
@@ -4190,59 +5347,55 @@ else
     esac
   fi
 
-  # readmeta takes no app argument: it parses every metadata/*.yml in the clone.
-  # So an unrelated upstream entry — typically one written for a newer
-  # fdroidserver than the one installed here — fails it, which says nothing
-  # about our file. Only count it when the complaint names our app.
-  say "fdroid readmeta"
-  if ! frun readmeta > "$WORK/readmeta.log" 2>&1; then
-    sed 's/^/     /' "$WORK/readmeta.log"
+  summary_check
+
+  # readmeta takes no app argument: it parses every metadata/*.yml in the
+  # clone, so only a complaint that names this app counts.
+  say "fdroid readmeta — the recipes in fdroiddata parse"
+  if frun readmeta > "$WORK/readmeta.log" 2>&1; then
+    chk "fdroid readmeta" passed
+  else
+    sed 's/^/     /' "$WORK/readmeta.log" | tail -n 20
     if grep -Fq "$APPID" "$WORK/readmeta.log"; then
-      VALID_FAIL="$VALID_FAIL readmeta"
+      VALID_FAIL="$VALID_FAIL readmeta"; chk "fdroid readmeta" "failed: it cannot read metadata/$APPID.yml"
     else
-      warn "readmeta tripped over another app in fdroiddata, not $APPID"
-      note "an upstream entry your fdroidserver is too old to parse — not your problem"
-      note "rewritemeta and lint below only look at your app, so trust those"
+      note "another app's recipe trips it, not $APPID — nothing for you to fix"
+      chk "fdroid readmeta" "passed: (another app's recipe trips it, not yours)"
     fi
   fi
-  say "fdroid rewritemeta $APPID"; frun rewritemeta "$APPID" || VALID_FAIL="$VALID_FAIL rewritemeta"
-  # CI's rewritemeta (Debian's ruamel.yaml 0.18) gives a word longer than a line
-  # a line of its own; a newer local fdroid does not, and CI then fails the job.
-  CIW="$(rcp ciwrap "$FDROIDDATA/metadata/$APPID.yml" || true)"
-  [ -n "$CIW" ] && note "laid out long values the way fdroiddata's CI does: $(printf '%s' "$CIW" | tr '\n' ' ')"
-  say "fdroid lint $APPID";        frun lint "$APPID"        || VALID_FAIL="$VALID_FAIL lint"
 
-  # fdroiddata's CI validates every changed file against schemas/metadata.json
-  # before anything else. lint does not do this, so a file that passes lint can
-  # still be rejected minutes later; run the same check here.
-  SCHEMA="$FDROIDDATA/schemas/metadata.json"
-  if [ ! -f "$SCHEMA" ]; then
-    note "no schemas/metadata.json in the clone — skipping the schema check"
-  elif have check-jsonschema; then
-    say "check-jsonschema metadata/$APPID.yml"
-    ( cd "$FDROIDDATA" && check-jsonschema --schemafile schemas/metadata.json \
-        "metadata/$APPID.yml" ) || VALID_FAIL="$VALID_FAIL schema"
-  elif python3 -c 'import jsonschema, yaml' 2>/dev/null; then
-    say "validating against schemas/metadata.json (python jsonschema)"
-    python3 - "$SCHEMA" "$FDROIDDATA/metadata/$APPID.yml" <<'PYSCHEMA' || VALID_FAIL="$VALID_FAIL schema"
-import json, sys, jsonschema, yaml
-schema = json.load(open(sys.argv[1]))
-doc = yaml.safe_load(open(sys.argv[2]))
-errors = sorted(jsonschema.Draft7Validator(schema).iter_errors(doc), key=lambda e: list(e.path))
-for e in errors:
-    print("   $." + ".".join(str(p) for p in e.path) + ": " + e.message)
-sys.exit(1 if errors else 0)
-PYSCHEMA
+  say "fdroid rewritemeta $APPID — laid out the way fdroiddata wants it"
+  RW_BEFORE="$(cksum < "$FDROIDDATA/metadata/$APPID.yml")"
+  if frun rewritemeta "$APPID" > "$WORK/rewritemeta.log" 2>&1; then
+    # the pipeline's rewritemeta (Debian's ruamel.yaml 0.18) gives a word longer
+    # than a line a line of its own; a newer local one does not, and the
+    # pipeline would then fail on the difference
+    rcp ciwrap "$FDROIDDATA/metadata/$APPID.yml" >/dev/null || true
+    if [ "$RW_BEFORE" != "$(cksum < "$FDROIDDATA/metadata/$APPID.yml")" ]; then
+      chk "fdroid rewritemeta" "passed: laid out the way the pipeline wants it now"
+    else
+      chk "fdroid rewritemeta" passed
+    fi
   else
-    note "no check-jsonschema — CI validates against schemas/metadata.json, you cannot"
-    note "install it with: pipx install check-jsonschema   (or nix profile install nixpkgs#check-jsonschema)"
+    sed 's/^/     /' "$WORK/rewritemeta.log" | tail -n 20
+    VALID_FAIL="$VALID_FAIL rewritemeta"; chk "fdroid rewritemeta" "failed: see above"
   fi
-  if [ "$YMLSUM" != "$(cksum < "$FDROIDDATA/metadata/$APPID.yml")" ]; then
-    note "rewritemeta reformatted the file — that is normal"
+
+  say "fdroid lint $APPID"
+  if frun lint "$APPID" > "$WORK/lint.log" 2>&1; then
+    chk "fdroid lint" passed
+    sed 's/^/     /' "$WORK/lint.log" | head -n 10
+  else
+    sed 's/^/     /' "$WORK/lint.log" | tail -n 25
+    VALID_FAIL="$VALID_FAIL lint"; chk "fdroid lint" "failed: see above"
   fi
+
+  schema_check
+  redirect_check
+  checkupdates_check
 
   if [ -n "$VALID_FAIL" ]; then
-    warn "failed:$VALID_FAIL — maintainers' CI would reject this as it is"
+    warn "failed:$VALID_FAIL — fdroiddata's pipeline would stop on this"
     if [ "$ASSUME_YES" = 1 ]; then
       KEEP_WORK=1
       die "fix metadata/$APPID.yml in $FDROIDDATA and re-run"
@@ -4263,33 +5416,58 @@ PYSCHEMA
       case "${VALID_CH:-e}" in
         p|P*) ;;
         s|S*) KEEP_WORK=1; die "fix metadata/$APPID.yml in $FDROIDDATA and re-run" ;;
-        *)    if edit_file "$FDROIDDATA/metadata/$APPID.yml"; then
-                YMLSUM="$(cksum < "$FDROIDDATA/metadata/$APPID.yml")"
-                VALIDATE_AGAIN=1
-              fi ;;
+        *)    if edit_file "$FDROIDDATA/metadata/$APPID.yml"; then VALIDATE_AGAIN=1; fi ;;
       esac
     fi
-  else
-    ok "metadata validates"
   fi
   done
 
-  # The full build is the best predictor of acceptance, but slow (Android SDK,
-  # the whole toolchain): only with --build, or when asked for with --ask. It is
-  # outside the check-and-edit loop above: nobody wants it repeated on every edit.
-  if [ "$RUN_BUILD" = 1 ] || { [ "$ASK_ALL" = 1 ] && confirm "Run 'fdroid build -v -l $APPID' now (slow)?" n; }; then
+  fastlane_tool_check
+  apk_scan_check
+
+  # The full build is the best predictor of acceptance, but slow (the Android
+  # SDK, the whole toolchain), and outside the loop above: nobody wants it
+  # repeated on every edit. Here it runs without --on-server, so the recipe's
+  # sudo: lines are skipped (fdroidserver never runs them outside its build
+  # server): a recipe that needs them can fail here and pass in the pipeline.
+  if [ "$FD_SCANNER_OK" = 0 ]; then
+    chk "fdroid build" "skipped: fdroidserver's scanner does not load here — the pipeline builds it"
+  elif [ -z "${ANDROID_HOME:-}${ANDROID_SDK_ROOT:-}" ]; then
+    chk "fdroid build" "skipped: no Android SDK here (ANDROID_HOME) — the pipeline builds it"
+  elif [ "$RUN_BUILD" = 1 ] || { [ "$ASSUME_YES" = 0 ] \
+       && note "the full build takes 10 minutes to an hour; sudo: lines are skipped outside F-Droid's build server" \
+       && confirm "Run it here too (fdroid build)?" n; }; then
     say "fdroid build -v -l $APPID"
-    if ! frun build -v -l "$APPID"; then
-      warn "the build failed — F-Droid's CI would fail the same way"
+    if frun build -v -l "$APPID"; then
+      chk "fdroid build" passed
+    else
+      warn "the build failed — F-Droid's pipeline would fail the same way"
+      chk "fdroid build" "failed: see above"
       if [ "$ASSUME_YES" = 1 ] || ! go "Carry on and push anyway?"; then
         KEEP_WORK=1
         die "fix the app or metadata/$APPID.yml in $FDROIDDATA, then re-run"
       fi
     fi
   else
-    note "full build skipped (--build to run it; F-Droid's CI builds it anyway)"
+    chk "fdroid build" "skipped: not run this time (--build runs it here) — the pipeline builds it"
   fi
 fi
+
+# --- how it all went, before anything leaves this machine
+step "Checks — how it went"
+chk_summary
+CHK_FAILED="$(chk_with failed)"
+CHK_WARNED="$(chk_with warn)"
+printf '\n'
+if [ -n "$CHK_FAILED" ]; then
+  warn "${B}not ready yet${R}${YLW}: fix $CHK_FAILED first — the pipeline or the reviewers would ask for it"
+elif [ -n "$CHK_WARNED" ]; then
+  ok "every check the pipeline runs passed"
+  warn "look at these before sending it — reviewers usually ask: $CHK_WARNED"
+else
+  ok "${B}Everything is finished, and every check passed — ready for the merge request.${R}"
+fi
+if [ -n "$(chk_with skipped)" ]; then note "left to the pipeline: $(chk_with skipped)"; fi
 
 # A recipe copy kept in the app repo (e.g. fdroid/<appid>.yml) is offered the
 # final file, so it never drifts from the merge request. It is not committed.
@@ -4466,10 +5644,9 @@ mr_description() {
 }
 
 if [ "$DRYRUN" = 1 ]; then
-  warn "dry run — not committing, pushing or opening a merge request"
-  note "so 'fdroid checkupdates --auto' was not run either: it needs the commit,"
-  note "and CI fails the job on any diff it would produce"
-  note "$FDROIDDATA (branch $BRANCH)"
+  warn "dry run — nothing was committed, pushed or opened"
+  note "metadata/$APPID.yml is in $FDROIDDATA (branch $BRANCH), as it would be sent"
+  if [ -z "$CHK_FAILED" ]; then ok "run it again without --dry-run to send it"; fi
   exit 0
 fi
 if ! go "Commit and push to $FORKURL ($BRANCH)?"; then
@@ -4484,68 +5661,6 @@ if [ -z "$(git -C "$FDROIDDATA" config user.email 2>/dev/null || true)" ]; then
            -c "user.email=$(git -C "$REPO" config user.email 2>/dev/null || echo "${AUTHOREMAIL:-nobody@example.com}")")
 fi
 git -C "$FDROIDDATA" "${ID_ARGS[@]}" commit -q -m "$COMMITMSG"
-
-# fdroiddata's CI runs `fdroid checkupdates --auto` on the branch and then fails
-# the job on any diff it produced: whatever that command writes — AutoName, read
-# out of the app's AndroidManifest, or a build for a newer tag — has to be in the
-# file already. Nothing else tells you this; lint and the schema are both happy
-# without it. It refuses to run on a metadata repo with uncommitted changes, so
-# it belongs here, just after the commit, and what it writes is folded into that
-# same commit to keep the merge request to one clean change. It clones the app
-# repo, so give it a moment.
-if [ "$RUNNER" != none ]; then
-  #  * without --allow-dirty it refuses to run at all when the clone has any
-  #    change or untracked file, and says only "Build metadata git repo has
-  #    uncommited changes!". We pass it, so leftovers no longer block the check.
-  # Three traps here, none of them yours:
-  #  * fdroiddata's committed config.yml is F-Droid's own production config, with
-  #    serverwebroot and the signing keys as {env: …} placeholders. Their CI sets
-  #    those; your clone cannot, so checkupdates logs an ERROR about the blank
-  #    serverwebroot while doing its actual work perfectly well. Give it a
-  #    throwaway sink and it runs without complaining.
-  #  * with -v it exits non-zero if any ERROR was logged, which turns that
-  #    harmless complaint into a failed run. CI passes -v because there the
-  #    variables are set and nothing is logged. We drop it and read the log.
-  #  * without --allow-dirty it refuses to run at all if the clone holds any
-  #    change or untracked file, saying only "Build metadata git repo has
-  #    uncommited changes!". We pass it.
-  say "fdroid checkupdates --auto $APPID (the CI check that compares diffs)"
-  # rsync will not create nested directories, and it deploys into repo/status/:
-  # make the whole path or it fails and logs an error for every status file.
-  mkdir -p "$WORK/deploy-sink/repo/status"
-  if serverwebroot="$WORK/deploy-sink" \
-     frun checkupdates --auto --allow-dirty "$APPID" > "$WORK/checkupdates.log" 2>&1; then
-    # it writes the file with the local fdroid's layout: put CI's back first
-    rcp ciwrap "$FDROIDDATA/metadata/$APPID.yml" >/dev/null || true
-    CU_ERRORS="$(grep -c 'ERROR' "$WORK/checkupdates.log" || true)"
-    if [ "${CU_ERRORS:-0}" -gt 0 ]; then
-      warn "checkupdates logged $CU_ERRORS error(s) — usually fdroiddata's config.yml"
-      warn "wanting F-Droid's own deploy environment, which only their CI has:"
-      grep 'ERROR' "$WORK/checkupdates.log" | head -3 | sed 's/^/       /'
-      note "harmless here, but it means this check may not have been complete"
-    fi
-    if git -C "$FDROIDDATA" diff --quiet -- "metadata/$APPID.yml"; then
-      ok "checkupdates has nothing to add"
-    else
-      note "checkupdates filled in what CI expects:"
-      git -C "$FDROIDDATA" --no-pager diff -- "metadata/$APPID.yml" \
-        | sed -n 's/^\([+-][^+-]\)/     \1/p'
-      git -C "$FDROIDDATA" add "metadata/$APPID.yml"
-      git -C "$FDROIDDATA" "${ID_ARGS[@]}" commit -q --amend --no-edit
-      ok "folded into the commit — CI fails on any diff this command produces"
-    fi
-  else
-    warn "checkupdates could not run:"
-    tail -5 "$WORK/checkupdates.log" | sed 's/^/     /'
-    note "CI runs it too, and fails the job on any diff it would produce"
-    note "AutoName is already in the file, so this is only a second opinion —"
-    note "what it would still catch is a newer tag than the one being submitted"
-    if ! go "Push anyway?"; then
-      KEEP_WORK=1
-      die "the log is in $WORK/checkupdates.log"
-    fi
-  fi
-fi
 
 # fdroiddata is a very large repo and the first push to a fresh fork can send a
 # lot of history. Dropping -q is the whole trick: git then reports its own
@@ -4630,8 +5745,25 @@ if [ -n "$MR_URL" ]; then
   if go "Watch the pipeline now and mark the merge request ready once it passes?"; then
     watch_pipeline "$PUSHED_SHA" || true
   fi
-  note "follow it from here on, with the reviewers' comments: fdroid-submit.sh --status $APPID"
 fi
+
+# --- where it stands now
+printf '\n'
+case "$(recall ST_STATUS)" in
+  review)
+    ok "${B}All done: every check passed, and merge request !${MR_URL##*/} is ready for review.${R}"
+    note "F-Droid's reviewers take it from here; their comments: fdroid-submit.sh --status $APPID" ;;
+  draft|submitted)
+    if [ "$(recall ST_PIPE)" = failed ]; then
+      warn "merge request !${MR_URL##*/} is open, but its pipeline failed — the failed jobs are above"
+      note "fix it and run this again: it pushes to the same merge request"
+    else
+      ok "${B}Sent: merge request !${MR_URL##*/} is open$([ "$(recall ST_STATUS)" = draft ] && echo ', as a draft until its pipeline passes').${R}"
+      note "follow it, and mark it ready once the pipeline passes: fdroid-submit.sh --status $APPID"
+    fi ;;
+  *)
+    ok "${B}Pushed: the branch is ready for its merge request — open it with the link above.${R}" ;;
+esac
 note "expect roughly 24-48 hours from merge until the app appears in F-Droid"
 }
 
