@@ -2091,6 +2091,15 @@ fi
 COMMIT="$(git -C "$REPO" rev-list -n1 "$TAG" 2>/dev/null || true)"
 [ -n "$COMMIT" ] || COMMIT="$TAG"
 
+# --- URLs from the git remote
+WEB_GUESS=""
+case "$ORIGIN" in
+  git@*)     WEB_GUESS="https://$(echo "$ORIGIN" | sed 's/^git@//; s/:/\//; s/\.git$//')" ;;
+  ssh://*)   WEB_GUESS="https://$(echo "$ORIGIN" | sed 's,^ssh://\(git@\)\?,,; s,:[0-9]*/,/,; s/\.git$//')" ;;
+  https://*) WEB_GUESS="${ORIGIN%.git}" ;;
+esac
+[ -n "$WEB_GUESS" ] || warn "no usable 'origin' remote — you will have to type the URLs"
+
 # --- a published release on the forge
 # The metadata's Changelog: field points at the releases page, and a tag alone
 # does not put anything there. Offered once the tag is pushed, because that is
@@ -2170,15 +2179,6 @@ if [ "$DRYRUN" = 0 ] && [ -n "$FORGE_CLI" ]; then
 elif [ -n "$FORGE" ] && [ "$DRYRUN" = 0 ]; then
   note "no $FORGE CLI logged in — a release for $TAG would have to be published by hand"
 fi
-
-# --- URLs from the git remote
-WEB_GUESS=""
-case "$ORIGIN" in
-  git@*)     WEB_GUESS="https://$(echo "$ORIGIN" | sed 's/^git@//; s/:/\//; s/\.git$//')" ;;
-  ssh://*)   WEB_GUESS="https://$(echo "$ORIGIN" | sed 's,^ssh://\(git@\)\?,,; s,:[0-9]*/,/,; s/\.git$//')" ;;
-  https://*) WEB_GUESS="${ORIGIN%.git}" ;;
-esac
-[ -n "$WEB_GUESS" ] || warn "no usable 'origin' remote — you will have to type the URLs"
 
 # ----------------------------------------------------- 1b. common MR blockers
 # Every check this run makes — the pitfalls below, then in stage 4 the ones
@@ -2586,6 +2586,34 @@ fi
 
 git -C "$FDROIDDATA" remote get-url upstream >/dev/null 2>&1 || \
   git -C "$FDROIDDATA" remote add upstream "$FDROIDDATA_UPSTREAM"
+# Your git config may send GitLab over ssh (url.…insteadOf, or an ssh remote).
+# ssh then needs gitlab.com's host key in ~/.ssh/known_hosts; without it, ssh
+# asks — or, with no terminal to ask in, fails every fetch and push. The key is
+# fetched and compared with the fingerprint GitLab publishes before anything
+# is added (docs.gitlab.com: "SSH host keys fingerprints").
+GITLAB_ED25519="SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8"
+gitlab_ssh_check() {
+  local url out fp line
+  url="$(git -C "$FDROIDDATA" ls-remote --get-url upstream 2>/dev/null || true)"
+  case "$url" in ssh://*gitlab.com*|git@gitlab.com:*) ;; *) return 0 ;; esac
+  have ssh || return 0
+  out="$(ssh -o BatchMode=yes -o ConnectTimeout=15 -T git@gitlab.com 2>&1 || true)"
+  case "$out" in *"Host key verification failed"*) ;; *) return 0 ;; esac
+  warn "your git reaches gitlab.com over ssh, and ssh does not know gitlab.com's host key"
+  { have ssh-keyscan && have ssh-keygen; } || { note "add it with: ssh -T git@gitlab.com (answer yes)"; return 0; }
+  line="$(ssh-keyscan -t ed25519 gitlab.com 2>/dev/null | grep -v '^#' | sed -n 1p || true)"
+  fp="$(printf '%s\n' "$line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)"
+  if [ "$fp" != "$GITLAB_ED25519" ]; then
+    warn "the key gitlab.com offers ($fp) is not the one GitLab publishes — not adding it"
+    return 0
+  fi
+  note "gitlab.com's key matches the one GitLab publishes: $fp"
+  if go "Add it to ~/.ssh/known_hosts?"; then
+    mkdir -p "$HOME/.ssh"; printf '%s\n' "$line" >> "$HOME/.ssh/known_hosts"
+    ok "added — ssh to gitlab.com works now"
+  fi
+}
+gitlab_ssh_check
 say "fetching upstream (git prints its own progress below)…"
 FETCH_T0=$SECONDS
 git -C "$FDROIDDATA" fetch upstream || die "could not fetch upstream fdroiddata"
@@ -4349,7 +4377,7 @@ check_reference_apk() {  # check_reference_apk <apk> [built] — what F-Droid's 
 # --- build the release APKs here: signed with your key the way your project
 # signs releases, and one per CPU type when the recipe has one build entry per
 # CPU type. BUILT_APKS lists what came out; BUILT_SHA is their key.
-BUILT_APKS=""; BUILT_SHA=""
+BUILT_APKS=""; BUILT_SHA=""; REF_BUILD=0
 can_build_here() {  # flutter for a Flutter app, the project's gradle wrapper otherwise
   if [ -n "$FLUTTER_DIR" ]; then have flutter; else [ -x "$REPO/gradlew" ]; fi
 }
@@ -4473,41 +4501,126 @@ app_keystores() {
   fi
 }
 
-# sign_built_apks — BUILT_APKS came out unsigned (the project signs releases by
-# hand): sign them with your release keystore, as you would yourself. The
-# password is asked for, used once and never kept.
-sign_built_apks() {
-  local stores=() ks pw alias f out signed=""
-  have apksigner || { warn "apksigner (Android build-tools) is needed to sign them"; return 1; }
+# kp_value <key.properties> <key> — one value from a properties file
+kp_value() { sed -nE "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" | sed -n 1p | tr -d '\r'; }
+kp_store() {  # kp_store <key.properties> — the keystore it names, as a full path
+  local kp="$1" store f
+  store="$(kp_value "$kp" storeFile)"; store="${store/#\~/$HOME}"
+  [ -n "$store" ] || return 0
+  for f in "$store" "$(dirname "$kp")/app/$store" "$(dirname "$kp")/$store" "$REPO/$SUBDIR/$store"; do
+    case "$f" in /*) if [ -f "$f" ]; then printf '%s' "$f"; return 0; fi ;; esac
+  done
+}
+
+# choose_keystore — SIGN_KS, SIGN_ALIAS, SIGN_PW, SIGN_KPW: your release key,
+# picked once a run. A key.properties that names the keystore — your build's,
+# or one in the project's secrets/ folder — gives the passwords; otherwise
+# they are asked for, used for this run only, and never written anywhere.
+SIGN_KS=""; SIGN_ALIAS=""; SIGN_PW=""; SIGN_KPW=""
+choose_keystore() {
+  local stores=() ks kp alias=""
+  [ -z "$SIGN_KS" ] || return 0
   while IFS= read -r ks; do
     if [ -n "$ks" ]; then stores+=("$ks"); fi
   done < <(app_keystores | awk '!seen[$0]++')
-  say "Sign it with your release key here? F-Droid compares its own build with your signed APK."
   stores+=("another keystore — give its path")
-  pick SIGN_KS 1 "${stores[@]}"
-  ks="${stores[$((SIGN_KS - 1))]}"
-  if [ "$SIGN_KS" = "${#stores[@]}" ]; then
+  say "Your release keystore — the key your APKs are signed with:"
+  pick SIGN_KS_N 1 "${stores[@]}"
+  ks="${stores[$((SIGN_KS_N - 1))]}"
+  if [ "$SIGN_KS_N" = "${#stores[@]}" ]; then
     ask KEYSTORE "Path to your release keystore" ""
     ks="${KEYSTORE/#\~/$HOME}"
   fi
   [ -f "$ks" ] || { warn "no such file: $ks"; return 1; }
-  printf '   %sPassword of %s%s (not shown, not kept): ' "$B" "${ks##*/}" "$R" >&2
-  IFS= read -rs pw || true; printf '\n' >&2
-  alias="$(FD_KS_PASS="$pw" keytool -list -keystore "$ks" -storepass:env FD_KS_PASS 2>/dev/null \
-           | awk -F', ' '/PrivateKeyEntry/ {print $1; exit}')"
-  [ -n "$alias" ] || { warn "could not open ${ks##*/} — a wrong password?"; return 1; }
-  mkdir -p "$WORK/signed"
+  while IFS= read -r kp; do
+    if [ -n "$kp" ] && [ "$(kp_store "$kp")" = "$ks" ]; then
+      SIGN_PW="$(kp_value "$kp" storePassword)"; SIGN_KPW="$(kp_value "$kp" keyPassword)"
+      alias="$(kp_value "$kp" keyAlias)"
+      [ -z "$SIGN_PW" ] || note "its passwords come from ${kp/#$HOME/~}"
+      break
+    fi
+  done < <(key_props)
+  if [ -z "$SIGN_PW" ]; then
+    printf '   %sPassword of %s%s (not shown, not kept): ' "$B" "${ks##*/}" "$R" >&2
+    IFS= read -rs SIGN_PW || true; printf '\n' >&2
+  fi
+  SIGN_KPW="${SIGN_KPW:-$SIGN_PW}"
+  [ -n "$alias" ] || alias="$(FD_KS_PASS="$SIGN_PW" keytool -list -keystore "$ks" -storepass:env FD_KS_PASS 2>/dev/null \
+                              | awk -F', ' '/PrivateKeyEntry/ {print $1; exit}')"
+  [ -n "$alias" ] || { warn "could not open ${ks##*/} — a wrong password?"; SIGN_PW=""; return 1; }
+  SIGN_KS="$ks"; SIGN_ALIAS="$alias"
+}
+
+# apksigner_cmd — APKSIGNER: an apksigner that can sign without re-aligning
+# (--alignment-preserved, build-tools 35 and later)
+APKSIGNER=()
+apksigner_cmd() {
+  local j
+  [ "${#APKSIGNER[@]}" = 0 ] || return 0
+  if have apksigner && apksigner sign --help 2>&1 | grep -q 'alignment-preserved'; then APKSIGNER=(apksigner); return 0; fi
+  for j in $(ls -d "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/nonexistent}}"/build-tools/*/lib/apksigner.jar 2>/dev/null | sort -rV); do
+    if java -jar "$j" sign --help 2>&1 | grep -q 'alignment-preserved'; then APKSIGNER=(java -jar "$j"); return 0; fi
+  done
+  warn "no apksigner that can sign without re-aligning (Android build-tools 35 or later)"
+  return 1
+}
+apk_minsdk() {  # apk_minsdk <apk> — its minSdkVersion, when aapt2 is at hand
+  local a
+  a="$(command -v aapt2 2>/dev/null || ls -d "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/nonexistent}}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1 || true)"
+  [ -n "$a" ] || return 0
+  "$a" dump badging "$1" 2>/dev/null | sed -nE "s/^(min)?[sS]dkVersion:'([0-9]+)'.*/\2/p" | sed -n 1p || true
+}
+
+# sign_apk <unsigned> <out> — signed with your release key the way
+# fdroidserver can check: F-Droid builds the APK itself and copies your
+# signature onto it without moving a byte, so the signed APK must keep the
+# unsigned one's layout. apksigner re-aligns by default (zipalign does too),
+# and the v1 signature it adds marks its entries in a way fdroidserver does
+# not repeat: so --alignment-preserved, and no v1 from Android 7 (minSdk 24) on.
+sign_apk() {
+  local src="$1" out="$2" min v1=true
+  choose_keystore || return 1
+  apksigner_cmd || return 1
+  min="$(apk_minsdk "$src")"
+  if [ -n "$min" ] && [ "$min" -ge 24 ]; then v1=false; fi
+  mkdir -p "$(dirname "$out")"
+  if ! FD_KS_PASS="$SIGN_PW" FD_KEY_PASS="$SIGN_KPW" "${APKSIGNER[@]}" sign --ks "$SIGN_KS" --ks-key-alias "$SIGN_ALIAS" \
+       --ks-pass env:FD_KS_PASS --key-pass env:FD_KEY_PASS --alignment-preserved true \
+       --v1-signing-enabled "$v1" --out "$out" "$src" >"$WORK/sign.log" 2>&1; then
+    warn "apksigner could not sign ${src##*/}:"; tail -n 3 "$WORK/sign.log" | sed 's/^/       /'
+    return 1
+  fi
+  rm -f "$out.idsig"
+}
+
+# ref_matches <signed> <unsigned> — fdroidserver's own check, as the pipeline
+# runs it: your signature copied onto F-Droid's build has to verify
+cat > "$WORK/verify-ref.py" <<'PYVERIFY'
+import logging, sys, tempfile
+from fdroidserver import common
+logging.basicConfig(level=logging.ERROR)
+common.config = {}
+common.fill_config_defaults(common.config)
+err = common.verify_apks(sys.argv[1], sys.argv[2], tempfile.mkdtemp())
+if err:
+    print(err)
+    sys.exit(1)
+PYVERIFY
+ref_matches() { fpy "$WORK/verify-ref.py" "$1" "$2" > "$WORK/verify-ref.log" 2>&1; }
+
+# sign_built_apks — BUILT_APKS came out unsigned (the project signs releases by
+# hand): sign them with your release keystore, as you would yourself. The
+# password is asked for, used once and never kept.
+sign_built_apks() {
+  local f out signed=""
+  say "Sign it with your release key here? F-Droid compares its own build with your signed APK."
   while IFS= read -r f; do
     out="$WORK/signed/$(basename "${f%-unsigned.apk}")"; out="${out%.apk}.apk"
-    if ! FD_KS_PASS="$pw" apksigner sign --ks "$ks" --ks-key-alias "$alias" --ks-pass env:FD_KS_PASS \
-         --key-pass env:FD_KS_PASS --out "$out" "$f" >/dev/null 2>&1; then
-      warn "apksigner could not sign ${f##*/}"; return 1
-    fi
-    rm -f "$out.idsig"
+    sign_apk "$f" "$out" || return 1
     signed="${signed:+$signed$'\n'}$out"
   done <<< "$BUILT_APKS"
   BUILT_APKS="$signed"
-  ok "signed with ${ks##*/} ($alias)"
+  ok "signed with ${SIGN_KS##*/} ($SIGN_ALIAS)"
 }
 
 # upload_release_apks — BUILT_APKS onto release $TAG, named as Binaries says
@@ -4573,11 +4686,13 @@ local_apks() {  # release APKs in this repo's build folders, newest first
     if [ -d "$d" ]; then find "$d" -name '*.apk' -not -iname '*debug*' -not -iname '*unsigned*' -printf '%T@ %p\n' 2>/dev/null; fi
   done | sed 's#/\./#/#g' | sort -rn | awk '{ sub(/^[^ ]+ /, ""); if (!seen[$0]++) print }' | head -4
 }
-key_props() {  # the properties files your gradle build reads its release keystore from
-  local f
+key_props() {  # the properties files naming your release keystore: your build's, and the project's secrets/
+  local f sec=""
+  sec="$(app_project_dir)"; [ -z "$sec" ] || sec="$sec/secrets"
   for f in "$REPO/android/key.properties" ${FLUTTER_DIR:+"$REPO/$FLUTTER_DIR/android/key.properties"} \
            "$REPO/key.properties" "$REPO/keystore.properties" "$REPO/signing.properties" \
-           "$REPO/$SUBDIR/key.properties" "$REPO/$SUBDIR/keystore.properties"; do
+           "$REPO/$SUBDIR/key.properties" "$REPO/$SUBDIR/keystore.properties" \
+           ${sec:+"$sec"/*.properties}; do
     if [ -f "$f" ] && grep -q 'storeFile' "$f" 2>/dev/null; then
       printf '%s/%s\n' "$(cd "$(dirname "$f")" && pwd -P)" "$(basename "$f")"
     fi
@@ -4625,6 +4740,10 @@ ask_signkey() {
     choices+=("read it from the keystore ${kp#"$REPO"/} names"$'\n'"with the passwords in that file, or it asks; nothing is kept")
     acts+=("ks:$kp")
   done < <(key_props)
+  if [ -n "$(app_keystores | head -1)" ]; then
+    choices+=("read it from your release keystore"$'\n'"the one in your project's secrets/ folder, or another; asks for its password unless a key.properties has it")
+    acts+=(keystore)
+  fi
   choices+=("read it from another APK — give its path"); acts+=(path)
   choices+=("type or paste it"); acts+=(type)
   pick SIGN_SRC 1 "${choices[@]}"
@@ -4638,6 +4757,11 @@ ask_signkey() {
            fi ;;
     apk:*) SIGNKEY="$(apk_cert "${a#apk:}")"; check_reference_apk "${a#apk:}" ;;
     ks:*)  SIGNKEY="$(keystore_cert "${a#ks:}" || true)" ;;
+    keystore)
+           if choose_keystore; then
+             SIGNKEY="$(FD_KS_PASS="$SIGN_PW" keytool -list -v -keystore "$SIGN_KS" -alias "$SIGN_ALIAS" \
+                          -storepass:env FD_KS_PASS 2>/dev/null | awk '/SHA256:/ {print $2; exit}' | tr -d ':' | tr 'A-F' 'a-f')"
+           fi ;;
     path)  ask APKPATH "Path to your signed release APK" ""
            APKPATH="${APKPATH/#\~/$HOME}"
            if [ -f "$APKPATH" ]; then SIGNKEY="$(apk_cert "$APKPATH")"; check_reference_apk "$APKPATH"
@@ -4695,9 +4819,9 @@ ask_publishing() {
   fi
   if can_build_here; then
     if [ "$K" -gt 1 ]; then
-      choices+=("build them here now — one APK per CPU type, signed with your key — and put them on release $TAG")
+      choices+=("build them here the way F-Droid does — one APK per CPU type — sign them with your key, and put them on release $TAG")
     else
-      choices+=("build it here now, signed with your key, and put it on release $TAG")
+      choices+=("build it here the way F-Droid does, sign it with your key, and put it on release $TAG")
     fi
     acts+=(build)
   fi
@@ -4735,7 +4859,13 @@ ask_publishing() {
     fi
     break
   done
-  if [ "$act" = build ]; then
+  if [ "$act" = build ] && [ "$FD_SCANNER_OK" = 1 ] && [ -n "${ANDROID_HOME:-}${ANDROID_SDK_ROOT:-}" ]; then
+    # fdroidserver builds it in stage 4, once the recipe is written: exactly
+    # the APK the pipeline builds, so the one you sign is the one it compares
+    REF_BUILD=1
+    note "it is built in stage 4 by fdroidserver itself — the very APK F-Droid's pipeline builds —"
+    note "then signed with your key, checked the way the pipeline checks it, and put on the release"
+  elif [ "$act" = build ]; then
     if build_release_apks; then
       known="$BUILT_SHA"; from="from the APK$([ "$K" -gt 1 ] && echo s) just built"
       upload_release_apks
@@ -4757,13 +4887,13 @@ ask_publishing() {
       printf '%s\n' "$b" > "$RT/b/$n/binary"; echo s > "$RT/b/$n/binary.k"
       b="${b//%v/$VNAME}"; b="${b//%c/$(fv "$RT/b/$n/versionCode")}"
       [ -n "$url1" ] || url1="$b"
-      if [ "$DRYRUN" = 0 ] || [ "$act" != build ]; then binary_there "$b"; fi
+      if [ "$act" != build ]; then binary_there "$b"; fi
     done
     ok "each build entry points at its own APK on the release page"
   else
     rset top/Binaries s "$BINARIES"
     b="${BINARIES//%v/$VNAME}"; url1="${b//%c/$VCODE}"
-    if [ "$DRYRUN" = 0 ] || [ "$act" != build ]; then binary_there "$url1"; fi
+    if [ "$act" != build ]; then binary_there "$url1"; fi
     for n in $(seq 1 "$K"); do rm -f "$RT/b/$n/binary" "$RT/b/$n/binary.k"; done
   fi
 
@@ -5354,6 +5484,127 @@ checkupdates_check() {
   fi
 }
 
+has_binaries() { ls "$RR"/b/*/binary >/dev/null 2>&1 || [ -s "$RR/top/Binaries" ]; }
+
+# entry_ref <n> — "versionName TAB versionCode TAB the address of your APK" for build entry n
+entry_ref() {
+  local vn vc u
+  vn="$(fv "$RR/b/$1/versionName")"; vc="$(fv "$RR/b/$1/versionCode")"
+  u="$(fv "$RR/b/$1/binary")"; [ -n "$u" ] || u="$(fv "$RR/top/Binaries")"
+  u="${u//%v/$vn}"; u="${u//%c/$vc}"
+  printf '%s\t%s\t%s\n' "$vn" "$vc" "$u"
+}
+ver_tag() {  # ver_tag <versionName> — the release tag of that version, named like this one's
+  local p; p="$(tag_pattern)"
+  printf '%s' "${p//%v/$1}"
+}
+
+# The pipeline's "fdroid build" job, run here the same way: fdroid build
+# --test, one build entry at a time. With your own signed APKs it is the check
+# that decides — F-Droid builds each version from source, downloads your APK
+# from its binary: address, copies your signature onto its own build and ships
+# your APK only if that verifies. When your APK is missing, or is signed in a
+# way that cannot be carried over, it is made from F-Droid's very build: signed
+# with your key keeping the layout (see sign_apk), checked the way the pipeline
+# checks it, kept in your project's builds/ folder and put on the release.
+build_entry() {  # build_entry <versionCode> <log> — true when fdroid build passed
+  mkdir -p "$WORK/deploy-sink/repo/status"
+  rm -f "$FDROIDDATA/tmp/${APPID}_$1.apk"
+  serverwebroot="$WORK/deploy-sink" frun build --test --no-tarball --stop -v "$APPID:$1" > "$2" 2>&1 || true
+  grep -q 'Successfully built' "$2" && ! grep -qE '[0-9]+ builds? failed|Could not build app' "$2"
+}
+local_builds() {
+  local n vn vc url log unsigned failed=0 made=0 total=0 why
+  for n in $(seq 1 "$K"); do
+    IFS=$'\t' read -r vn vc url < <(entry_ref "$n")
+    total=$((total + 1)); log="$WORK/build-$vc.log"
+    if has_binaries; then say "fdroid build $APPID:$vc ($vn) — as the pipeline builds it, then compared with your APK"
+    else say "fdroid build $APPID:$vc ($vn) — as the pipeline builds it"; fi
+    note "a few minutes; its output goes to $log"
+    if build_entry "$vc" "$log"; then
+      if has_binaries; then ok "$vn: F-Droid's build and your APK at ${url##*/} are the same APK"
+      else ok "$vn builds"; fi
+      continue
+    fi
+    unsigned="$FDROIDDATA/tmp/${APPID}_$vc.apk"
+    why=""
+    if grep -q 'Downloading Binaries from .* failed' "$log"; then why=missing
+    elif grep -q 'compared built binary to supplied reference binary but failed' "$log"; then why=differs
+    elif grep -q 'supplied reference binary signed with' "$log"; then why=key
+    fi
+    if [ -z "$why" ] || [ ! -f "$unsigned" ]; then
+      warn "$vn did not build — F-Droid's pipeline would fail the same way:"
+      grep -E 'ERROR|FAILURE|What went wrong|error:' "$log" | head -8 | sed 's/^/       /'
+      note "the whole log: $log"; KEEP_WORK=1
+      failed=$((failed + 1)); continue
+    fi
+    case "$why" in
+      missing) warn "$vn builds, but your APK is not at $url" ;;
+      differs) warn "$vn builds, but your APK at ${url##*/} is not the APK F-Droid builds"
+               note "most often it was re-aligned (zipalign, or apksigner's default) or carries the old v1"
+               note "signature: either way fdroidserver cannot carry its signature over to its own build" ;;
+      key)     warn "$vn builds, but ${url##*/} is signed with another key than AllowedAPKSigningKeys" ;;
+    esac
+    if ! make_reference "$vn" "$vc" "$url" "$unsigned"; then failed=$((failed + 1)); continue; fi
+    made=$((made + 1))
+  done
+  if [ "$failed" -gt 0 ]; then chk "fdroid build" "failed: $failed of $total version(s), listed above"
+  elif [ "$made" -gt 0 ]; then chk "fdroid build" "passed: $made APK(s) made from F-Droid's own build and checked"
+  else chk "fdroid build" "passed: $total version(s) built$(has_binaries && echo ', your APKs match')"; fi
+}
+
+declare -A MADE_REF=()   # address -> the APK made for it here this run
+# make_reference <versionName> <versionCode> <address> <F-Droid's unsigned build>
+make_reference() {
+  local vn="$1" vc="$2" url="$3" unsigned="$4" name tag bdir out code
+  name="${url##*/}"; tag="$(ver_tag "$vn")"
+  if ! confirm "Make $name from F-Droid's own build — signed with your key, checked like the pipeline checks it?" y; then
+    return 1
+  fi
+  bdir="$(app_builds_dir)"; [ -n "$bdir" ] || { bdir="$WORK/builds"; KEEP_WORK=1; }
+  out="$bdir/$name"
+  sign_apk "$unsigned" "$out" || return 1
+  if ! ref_matches "$out" "$unsigned"; then
+    warn "fdroidserver does not accept even this one:"; sed 's/^/       /' "$WORK/verify-ref.log" | head -6
+    return 1
+  fi
+  local want got
+  got="$(apk_cert "$out")"; want="$(sigclean "$(sed -n 1p "$RR/top/AllowedAPKSigningKeys" 2>/dev/null || true)")"
+  if [ -n "$want" ] && [ "$got" != "$want" ]; then
+    warn "${SIGN_KS##*/} is not the key the recipe allows: it signs with $got,"
+    warn "AllowedAPKSigningKeys says $want — F-Droid would turn the APK away"
+    rm -f "$out"; SIGN_KS=""; SIGN_PW=""
+    return 1
+  fi
+  MADE_REF["$url"]="$out"
+  ok "$name: signed, and fdroidserver accepts it as F-Droid's build — in ${bdir/#$HOME/~}"
+  case "$url" in
+    "$WEB_GUESS/releases/download/$tag/"*) ;;
+    *) note "put it at $url yourself — it is in ${bdir/#$HOME/~}"; return 0 ;;
+  esac
+  if [ "$DRYRUN" = 1 ]; then warn "dry run — would put it on release $tag"; return 0; fi
+  if [ "$FORGE_CLI" != gh ]; then note "put it on release $tag yourself — it is in ${bdir/#$HOME/~}"; return 0; fi
+  if ! ( cd "$REPO" && gh release view "$tag" >/dev/null 2>&1 ); then
+    go "Release $tag is not on GitHub — publish it, with $name?" || return 0
+    local notes="$WORK/notes-$vc.md"
+    if [ -f "${FL_BASE:-/nonexistent}/changelogs/$vc.txt" ]; then cp "$FL_BASE/changelogs/$vc.txt" "$notes"; else printf '%s\n' "$tag" > "$notes"; fi
+    ( cd "$REPO" && gh release create "$tag" --verify-tag --title "$tag" --notes-file "$notes" "$out" ) >/dev/null 2>&1 \
+      || { warn "gh could not publish release $tag"; return 1; }
+    ok "release $tag published, with $name"; tlog "release $tag published with $name"
+  else
+    if [ "$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 20 "$url" 2>/dev/null || true)" = 200 ]; then
+      go "Replace $name on release $tag with this one? (same key; only the packing differs)" || return 0
+    fi
+    ( cd "$REPO" && gh release upload "$tag" "$out" --clobber ) >/dev/null 2>&1 \
+      || { warn "gh could not upload $name"; return 1; }
+    ok "uploaded $name to release $tag"; tlog "uploaded $name to release $tag"
+  fi
+  # what F-Droid will download is what was checked
+  code="$(curl -sL --max-time 300 -o "$WORK/check-$vc.apk" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  if [ "$code" = 200 ] && cmp -s "$WORK/check-$vc.apk" "$out"; then ok "the release serves exactly that APK"
+  else warn "the release did not serve the same file back yet (HTTP ${code:-none}) — check $url"; fi
+}
+
 # The pipeline's "check apk" job, for reproducible builds: it scans the APK
 # F-Droid would ship — yours, downloaded from the binary: address — with fdroid
 # scanner (non-free libraries, trackers, extra signing blocks, debuggable or
@@ -5364,7 +5615,7 @@ apk_scan_check() {
   for n in $(seq 1 "$K"); do
     u="$(fv "$RR/b/$n/binary")"; [ -n "$u" ] || u="$(fv "$RR/top/Binaries")"
     [ -n "$u" ] || continue
-    vc="$(fv "$RR/b/$n/versionCode")"; u="${u//%v/$VNAME}"; urls+=("${u//%c/$vc}")
+    vc="$(fv "$RR/b/$n/versionCode")"; u="${u//%v/$(fv "$RR/b/$n/versionName")}"; urls+=("${u//%c/$vc}")
   done
   [ "${#urls[@]}" -gt 0 ] || return 0
   if [ "$FD_SCANNER_OK" = 0 ]; then
@@ -5374,6 +5625,10 @@ apk_scan_check() {
   for u in "${urls[@]}"; do
     i=$((i + 1)); f="$WORK/scan-$i-${u##*/}"
     code="$(curl -sL --max-time 300 -o "$f" -w '%{http_code}' "$u" 2>/dev/null || true)"
+    # made here in a dry run, not uploaded yet: scan the very file that will be
+    if [ "$code" != 200 ] && [ -n "${MADE_REF[$u]:-}" ]; then
+      cp "${MADE_REF[$u]}" "$f"; code=200; note "${u##*/}: the APK made here (it goes on the release when you send it)"
+    fi
     if [ "$code" != 200 ]; then
       if [ "$code" = 404 ]; then
         warn "${u##*/} is not on the release yet — F-Droid downloads it from $u"; bad=$((bad + 1))
@@ -5529,7 +5784,6 @@ else
   done
 
   fastlane_tool_check
-  apk_scan_check
 
   # The full build is the best predictor of acceptance, but slow (the Android
   # SDK, the whole toolchain), and outside the loop above: nobody wants it
@@ -5540,25 +5794,21 @@ else
     chk "fdroid build" "skipped: fdroidserver's scanner does not load here — the pipeline builds it"
   elif [ -z "${ANDROID_HOME:-}${ANDROID_SDK_ROOT:-}" ]; then
     chk "fdroid build" "skipped: no Android SDK here (ANDROID_HOME) — the pipeline builds it"
-  elif [ "$RUN_BUILD" = 1 ] || { [ "$ASSUME_YES" = 0 ] \
-       && note "the full build takes 10 minutes to an hour; sudo: lines are skipped outside F-Droid's build server" \
-       && confirm "Run it here too (fdroid build)?" n; }; then
-    say "fdroid build --stop -v -l $APPID"
-    # without --stop it reports "1 build failed" and still exits 0
-    if frun build --stop -v -l "$APPID" 2>&1 | tee "$WORK/build.log" \
-       && ! grep -qE '[0-9]+ builds? failed|Could not build app' "$WORK/build.log"; then
-      chk "fdroid build" passed
-    else
-      warn "the build failed — F-Droid's pipeline would fail the same way"
-      chk "fdroid build" "failed: see above"
-      if [ "$ASSUME_YES" = 1 ] || ! go "Carry on and push anyway?"; then
-        KEEP_WORK=1
-        die "fix the app or metadata/$APPID.yml in $FDROIDDATA, then re-run"
-      fi
-    fi
+  elif [ "$RUN_BUILD" = 1 ] || [ "${REF_BUILD:-0}" = 1 ] || {
+         if has_binaries; then
+           note "with your own signed APKs, the build is the check that decides: F-Droid builds each"
+           note "version and ships your APK only if it is the same — a few minutes per version"
+           confirm "Build them here the way the pipeline does, and check your APKs against them?" y
+         else
+           [ "$ASSUME_YES" = 0 ] \
+             && note "the full build takes 10 minutes to an hour; sudo: lines are skipped outside F-Droid's build server" \
+             && confirm "Run it here too (fdroid build)?" n
+         fi; }; then
+    local_builds
   else
     chk "fdroid build" "skipped: not run this time (--build runs it here) — the pipeline builds it"
   fi
+  apk_scan_check
 fi
 
 # --- how it all went, before anything leaves this machine
