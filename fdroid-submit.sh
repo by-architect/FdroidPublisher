@@ -2282,6 +2282,57 @@ if ! git -C "$REPO" grep -qE 'includeInApk[[:space:]]*=?[[:space:]]*false' -- '*
   note "  android { dependenciesInfo { includeInApk = false; includeInBundle = false } }"
 fi
 
+# R8 — the tool that shrinks and optimizes the release build. F-Droid's
+# "check apk" job notes an APK built without it, and reviewers often ask for
+# it. Only suggested, never required: R8 can remove code an app reaches by
+# reflection, so it has to be tested before a release. Flutter turns it on by
+# itself unless the gradle file switches it off.
+r8_check() {
+  local rel off on kts
+  [ -f "$GRADLE_FILE" ] || return 0
+  kts=""; [ "${GRADLE_FILE##*.}" = kts ] && kts=1
+  on="$(sed -e 's,//.*,,' "$GRADLE_FILE" | grep -nE '(isMinifyEnabled[[:space:]]*=|minifyEnabled)[[:space:]]*true' | sed -n 1p || true)"
+  [ -z "$on" ] || { ok "R8 is on for the release build (code shrinking and optimizing)"; return 0; }
+  off="$(sed -e 's,//.*,,' "$GRADLE_FILE" | grep -nE '(isMinifyEnabled[[:space:]]*=|minifyEnabled)[[:space:]]*false' | sed -n 1p | cut -d: -f1 || true)"
+  if [ -n "$FLUTTER_DIR" ] && [ -z "$off" ]; then return 0; fi
+  rel="$(grep -nE '^[[:space:]]*(getByName\("release"\)|release)[[:space:]]*\{' "$GRADLE_FILE" | sed -n 1p | cut -d: -f1 || true)"
+  note "R8 is off: the release APK is not shrunk or optimized"
+  note "R8 removes unused code and makes the APK smaller and faster; F-Droid's reviewers often ask for it"
+  [ "$ASSUME_YES" = 1 ] && return 0
+  confirm "Show how to turn it on? (only a suggestion — nothing is changed)" n || return 0
+  if [ -n "$off" ]; then say "In ${GRADLE_FILE#"$REPO"/}, line $off — change false to true, and add the shrinkResources line:"
+  elif [ -n "$rel" ]; then say "In ${GRADLE_FILE#"$REPO"/}, in the release block at line $rel:"
+  else say "In ${GRADLE_FILE#"$REPO"/}, inside android { }:"; fi
+  if [ -n "$kts" ]; then
+    sed 's/^/       /' <<'EOF'
+buildTypes {
+    release {
+        isMinifyEnabled = true      // R8: shrink and optimize the code
+        isShrinkResources = true    // and drop unused images and strings
+        proguardFiles(
+            getDefaultProguardFile("proguard-android-optimize.txt"),
+            "proguard-rules.pro"
+        )
+    }
+}
+EOF
+  else
+    sed 's/^/       /' <<'EOF'
+buildTypes {
+    release {
+        minifyEnabled true          // R8: shrink and optimize the code
+        shrinkResources true        // and drop unused images and strings
+        proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+    }
+}
+EOF
+  fi
+  note "then build a release APK and try it on your phone: if something breaks, the class it"
+  note "lost goes in ${SUBDIR}/proguard-rules.pro as  -keep class com.example.Thing { *; }"
+  note "it changes the APK, so it goes into your next version (bump, commit, tag)"
+}
+r8_check
+
 # fdroiddata's build job fails an app whose gradle files fetch from a plain
 # http:// repository (its tools/audit-gradle.py): anyone on the way could hand
 # the build a different library.
